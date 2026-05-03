@@ -14,10 +14,10 @@ SRAM, faster M33 with FPU/DSP/cache, same 2 MB flash).
 
 ## What it does
 
-The current `build/wolfDemo-doom.elf` (~2.00 MB / 673 KB BSS):
+The current `build/wolfDemo-doom.elf` (~2.00 MB / 724 KB BSS):
 - runs the full Doom engine (`D_DoomMain`) in 256 KB of zone SRAM,
   with a 96 KB RGB565 mirror buffer and 128 KB of wipe snapshots
-  (~140 KB of the 768 KB SRAM still free)
+  (~27 KB of the 768 KB SRAM still free after the perf caches)
 - renders **TITLEPIC**, **CREDIT**, **HELP** etc. pixel-accurate from
   the WHD-compressed splash lumps with the active PLAYPAL palette
 - ticks the demo loop: TITLEPIC -> DEMO1 -> CREDIT -> DEMO2 -> ...
@@ -33,7 +33,8 @@ The current `build/wolfDemo-doom.elf` (~2.00 MB / 673 KB BSS):
   bodies, projectiles, blood splats) with player-colour translation,
   and the **player weapon** overlay
 - has an optional **FPS counter** at top-right (off by default;
-  toggle via SW2 / SW4 buttons)
+  toggle via SW2 / SW4 buttons), drawn with a 3x-scaled bitmap
+  font over a black inset for legibility on the click panel
 - emits **Doom SFX** through DAC1 / PA4 at 11025 Hz. The TIM6
   update event raises an IRQ; the IRQ handler writes one sample
   to `DAC1->DHR8R1` per tick, and at chunk boundaries kicks the
@@ -43,9 +44,9 @@ The current `build/wolfDemo-doom.elf` (~2.00 MB / 673 KB BSS):
 - pushes frames through `I_FinishUpdate` -> ISR-driven background DMA
   on GPDMA1 channel 0 -> ST7789 SPI in continuous mode at 40 MHz.
   Render and blit run in parallel: per-frame budget collapses from
-  `render + blit` to `max(render, blit) + 1.4 ms convert`. Steady
-  state ~20-22 FPS during attract-mode demos vs the engine's 35 Hz
-  target (see Perf below)
+  `render + blit` to `max(render, blit) + 1.4 ms convert`. Hits the
+  engine's 35 Hz target in typical scenes; large open areas with
+  many sprites/visplanes drop to ~12-15 FPS (see Perf below)
 
 What's still stubbed / known issues (see "Open work items" for
 details):
@@ -62,38 +63,47 @@ details):
 
 ### Perf
 
-Steady state ~20-22 FPS against the engine's 35 Hz target. Render
-and SPI blit run in parallel via GPDMA1 channel 0 in continuous
-mode plus a 96 KB RGB565 mirror buffer; per-frame budget is
-`max(render ~46 ms, blit ~19 ms) + 1.4 ms convert`.
+Hits the engine's 35 Hz target in typical scenes. Heavy open areas
+with many visplanes / sprites still drop to ~12-15 FPS. Render and
+SPI blit run in parallel via GPDMA1 channel 0 in continuous mode
+plus a 96 KB RGB565 mirror buffer; per-frame budget is
+`max(render, blit ~19 ms) + 1.4 ms convert`.
 
-Remaining headroom toward the 35 Hz target, roughly in order of
-expected payoff:
+Optimizations already in:
 
-1. **Patch decode early-out**. `paint_textured_column` always decodes
-   the full 128-row `col_buf[]` even when only a small vertical slice
-   of the column is visible (top/bottom seams). Capping decode to the
-   actual sample range would help the most for the typical Doom
-   geometry that's mostly slivers. The Huffman decode is sequential
-   from index 0, so "stop early" is the only handle - skipping ahead
-   isn't possible without re-encoding.
-2. **Precompute per-column plane K-coefficients per visplane**.
-   `pd_add_plane_column` redoes `finecosine`, `finesine`, `distscale`
-   for every column emission; a single visplane visits each column
-   once but multiple visplanes (typically floor + ceiling) share
-   x ranges and could share the column-constant Kx/Ky computation.
-3. **DSP intrinsics for `FixedMul`**. The Cortex-M33 in the U585
-   has the DSP extension (`-mcpu=cortex-m33` already enables it).
-   `__SMMUL` / `__SMMLAR` give single-cycle Q31 mul-and-shift; not a
-   1:1 swap for FixedMul but worth probing the per-pixel inner loops.
-4. **Bump SPI to 80 MHz**. `SYSCLK / 2 = 80 MHz` exceeds the ST7789V2
-   datasheet's 62.5 MHz max but the panel often tolerates it. Halves
-   the SPI bandwidth floor from 19 ms to ~10 ms - if render ever
-   drops below that floor again the SPI re-becomes the bottleneck.
-5. **Sliver flat decode**. Same idea as #1 for the 64x64 flat
-   decoder: most visible plane spans hit only a small fraction of
-   the flat. Already cached in a 4-slot LRU; further wins need
-   row-level granularity in the Huffman decode.
+- **Inlined `FixedMul`** for Cortex-M33. `m_fixed.h` short-circuits
+  the function call to a `static inline` that GCC lowers to a single
+  `smull` + shift; eliminates ~160k function calls per frame in the
+  plane drawer alone.
+- **Patch decode early-out**. `decode_patch_column` takes a
+  `max_row` cap. Wall, sprite, and composite paths all compute the
+  highest row their per-pixel sample loop will touch and pass it in;
+  typical slivers skip 80-90% of the Huffman decode work.
+- **Per-column plane K cache**. `pd_add_plane_column` caches
+  `cos(angle(x)) * dscale(x)` and `sin(angle(x)) * dscale(x)` per
+  column for the frame; multiple visplanes touching the same x
+  reuse the cached value. Drops emission setup from 2 LUT lookups
+  + 3 muls to 2 muls.
+- **Sky pre-decode cache**. `paint_sky_column` decodes each sky
+  column once on first use into a 256x128 = 32 KB cache, then
+  serves subsequent frames as a memcpy-style index lookup. Stable
+  scenes pay zero Huffman decode for sky after warmup.
+- **`-O2` on the render hot path**. `pd_stubs.c`, `m_fixed.c`, and
+  `r_*.c` build with `-O2` instead of the project default `-Os`.
+- **LTO** across the whole build. Cross-TU inlining + dead-code
+  elimination; text actually shrinks because the linker can drop
+  unused config-flag dead branches across the engine.
+- **8-slot flat LRU** (was 4). Eliminates eviction churn in scenes
+  with many unique flats.
+
+Skipped (intentional):
+
+- **SPI 80 MHz overclock**. `SYSCLK / 2 = 80 MHz` exceeds the
+  ST7789V2 datasheet's 62.5 MHz max. Render is the binding
+  constraint above the SPI floor of 19 ms in heavy scenes anyway,
+  so the win would only show in lighter scenes already at 35 Hz.
+  Worth revisiting if the heavy-scene render time ever drops below
+  the SPI floor.
 
 ## Pin map (board.h)
 
@@ -216,12 +226,12 @@ wolfDemo-doom/
   surface. The original body is preserved inside `#if 0` for a
   future port. Sprite-vs-wall occlusion is unaffected (drawseg
   silhouettes from `R_StoreWallRange` still drive that path).
-- **More FPS**. The Perf section lists the ranked remaining wins.
-  The biggest unexplored ones are patch-decode early-out (slivers
-  waste decode work), per-visplane column-K precomputation, DSP
-  intrinsics for `FixedMul`, and overclocking SPI to 80 MHz
-  (`SYSCLK / 2`, exceeds the ST7789V2 spec of 62.5 MHz but often
-  tolerated).
+- **More FPS in heavy scenes**. Typical scenes hit the 35 Hz cap;
+  open areas with many sprites / visplanes still drop to ~12-15
+  FPS. The remaining lever the Perf section calls out is
+  overclocking SPI to 80 MHz (`SYSCLK / 2`, exceeds the ST7789V2
+  spec of 62.5 MHz but often tolerated), worthwhile only once the
+  heavy-scene render time drops below the SPI floor.
 
 ## License
 

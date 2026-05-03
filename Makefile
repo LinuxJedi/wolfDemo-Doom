@@ -241,6 +241,7 @@ CFLAGS  := $(CPU) $(DEFINES) $(DOOM_DEFINES) $(INCLUDES) \
            -Wno-missing-field-initializers \
            -ffunction-sections -fdata-sections \
            -fno-common \
+           -flto \
            -std=gnu11 -Os -g3
 
 ASFLAGS := $(CPU) -Wall -g3
@@ -249,6 +250,7 @@ LDFLAGS := $(CPU) -T$(LDSCRIPT) \
            -Wl,--gc-sections \
            -Wl,-Map=$(BUILD_DIR)/$(PROJECT).map \
            --specs=nano.specs --specs=nosys.specs \
+           -flto \
            -u _printf_float
 
 LIBS := -lc -lm -lnosys
@@ -273,6 +275,27 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/%.o: %.s
 	@mkdir -p $(dir $@)
 	$(AS) $(ASFLAGS) -c $< -o $@
+
+# Render hot path: build with -O2 instead of -Os. The default size
+# optimization avoids unrolling and aggressive scheduling that the
+# per-pixel loops in pd_stubs and r_*.c need to hit the 35 Hz target.
+HOT_CFLAGS := $(filter-out -Os,$(CFLAGS)) -O2
+
+HOT_C_SRCS := \
+    src/doom_glue/pd_stubs.c \
+    doom/src/m_fixed.c \
+    doom/src/doom/r_draw.c \
+    doom/src/doom/r_main.c \
+    doom/src/doom/r_plane.c \
+    doom/src/doom/r_segs.c \
+    doom/src/doom/r_things.c \
+    doom/src/doom/r_bsp.c
+
+HOT_OBJS := $(addprefix $(BUILD_DIR)/,$(HOT_C_SRCS:.c=.o))
+
+$(HOT_OBJS): $(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(HOT_CFLAGS) -c $< -o $@
 
 # Wrap the WAD blob into an ELF object whose data lives in section .wad.
 # The objcopy --rename-section moves the default .data into our linker's
@@ -303,7 +326,7 @@ clean:
 # Default tty - override with `make flash TTY=/dev/...`. The board exposes
 # its FT231X-equivalent USB-UART bridge as /dev/cu.usbserial-* on macOS.
 TTY ?= $(shell ls /dev/cu.usbserial-* 2>/dev/null | head -1)
-BAUD ?= 115200
+BAUD ?= 921600
 
 flash: $(BIN)
 	@if [ -z "$(TTY)" ]; then \

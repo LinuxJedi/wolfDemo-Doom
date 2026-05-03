@@ -186,9 +186,19 @@ static void load_patch_decoder(int patch_num)
 /* Decode column `col` of the cached patch into `out`. Output is a
  * 128-byte buffer that R_DrawColumn-style sampling (`& 127`) can index
  * directly. Patches shorter than 128 are wrap-padded by repeating from
- * the start, matching the pd_render.cpp h<127 fixup heuristic. */
-static void decode_patch_column(int col, uint8_t *out)
+ * the start, matching the pd_render.cpp h<127 fixup heuristic.
+ *
+ * `max_row` is the highest output index the caller will sample
+ * (inclusive, [0, 127]). Decode is sequential from row 0 with no skip
+ * support, but we can stop early once we've produced all the rows the
+ * caller needs - a meaningful win for the typical Doom sliver
+ * geometry where only a handful of rows of a 128-row column survive
+ * top/bottom seam clipping. */
+static void decode_patch_column(int col, uint8_t *out, int max_row)
 {
+    if (max_row < 0) return;
+    if (max_row >= WHD_TEXTURE_COL_HEIGHT) max_row = WHD_TEXTURE_COL_HEIGHT - 1;
+
     uint16_t col_offset = cached_col_offsets[col];
     if ((col_offset >> 8) == 0xff) {
         col_offset = cached_col_offsets[col_offset & 0xff];
@@ -205,6 +215,7 @@ static void decode_patch_column(int col, uint8_t *out)
 
     int h = cached_height;
     if (h > WHD_TEXTURE_COL_HEIGHT) h = WHD_TEXTURE_COL_HEIGHT;
+    int decode_h = (max_row + 1 < h) ? (max_row + 1) : h;
 
     if (cached_encoding == 0) {
         /* Single-byte Huffman, no delta. The splash decoder asserts
@@ -214,13 +225,13 @@ static void decode_patch_column(int col, uint8_t *out)
          * encoding 0 - bailing to memset(0) was painting them as
          * solid black silhouettes. Mirrors pd_render.cpp's
          * draw_patch_columns encoding==0 path. */
-        for (int y = 0; y < h; y++) {
+        for (int y = 0; y < decode_h; y++) {
             out[y] = th_decode_table_special(splash_decoder_buf,
                                              splash_prefix_lengths, &bi);
         }
     } else {
         uint8_t prev = 0;
-        for (int y = 0; y < h; y++) {
+        for (int y = 0; y < decode_h; y++) {
             uint16_t p = th_decode_table_special_16(splash_decoder_buf,
                                                     splash_prefix_lengths, &bi);
             if (p < 256) {
@@ -231,8 +242,9 @@ static void decode_patch_column(int col, uint8_t *out)
             out[y] = prev;
         }
     }
-    /* Wrap-pad shorter textures so `& 127` sampling stays sane. */
-    for (int y = h; y < WHD_TEXTURE_COL_HEIGHT; y++) {
+    /* Wrap-pad shorter textures so `& 127` sampling stays sane. Only
+     * fills up to max_row - if max_row < h we never enter this loop. */
+    for (int y = h; y <= max_row; y++) {
         out[y] = out[y - h];
     }
 }
@@ -386,12 +398,15 @@ static void paint_composite_column(void)
                     if (cached_width > 0) {
                         int pcol = (uint8_t)(target_col - base + xoff);
                         if (pcol >= cached_width) pcol %= cached_width;
-                        uint8_t col_buf[WHD_TEXTURE_COL_HEIGHT];
-                        decode_patch_column(pcol, col_buf);
                         int n = copy_len;
                         if (src_yoff + n > WHD_TEXTURE_COL_HEIGHT) {
                             n = WHD_TEXTURE_COL_HEIGHT - src_yoff;
                         }
+                        uint8_t col_buf[WHD_TEXTURE_COL_HEIGHT];
+                        /* Per-segment we only sample [src_yoff,
+                         * src_yoff + n - 1] of the patch column. */
+                        decode_patch_column(pcol, col_buf,
+                                            src_yoff + n - 1);
                         for (int yy = 0; yy < n; yy++) {
                             pixels[y + yy] = col_buf[src_yoff + yy];
                         }
@@ -483,8 +498,98 @@ static void paint_textured_column(uint8_t fallback_colour)
     int col = dc_source.col;
     if (col >= cached_width) col %= cached_width;
 
+    int yl = dc_yl, yh = dc_yh;
+    if (yl < 0) yl = 0;
+    if (yh > DOOM_H - 1) yh = DOOM_H - 1;
+    if (yl > yh || dc_x < 0 || dc_x >= DOOM_W) return;
+
+    fixed_t fracstep = dc_iscale;
+    fixed_t frac = dc_texturemid + (yl - centery) * fracstep;
+
+    /* Compute the highest col_buf[] row the per-pixel loop will touch
+     * so decode_patch_column can stop early. Sampling does
+     * `(frac >> FRACBITS) & 127`, so the integer-row range walked from
+     * frac0 to frac1 modulo 128 gives us the upper bound. If the span
+     * itself reaches 128 rows or it straddles a 128-row boundary,
+     * fall back to a full decode. */
+    int max_row;
+    int span_rows = yh - yl;
+    int64_t span_frac = (int64_t)span_rows * (int64_t)fracstep;
+    int64_t span_abs = span_frac < 0 ? -span_frac : span_frac;
+    if (span_abs >= ((int64_t)WHD_TEXTURE_COL_HEIGHT << FRACBITS)) {
+        max_row = WHD_TEXTURE_COL_HEIGHT - 1;
+    } else {
+        fixed_t frac_end = frac + (fixed_t)span_frac;
+        fixed_t lo = (frac < frac_end) ? frac : frac_end;
+        fixed_t hi = (frac < frac_end) ? frac_end : frac;
+        int lo_row = (int)((lo >> FRACBITS) & (WHD_TEXTURE_COL_HEIGHT - 1));
+        int hi_row = (int)((hi >> FRACBITS) & (WHD_TEXTURE_COL_HEIGHT - 1));
+        max_row = (lo_row > hi_row) ? (WHD_TEXTURE_COL_HEIGHT - 1)
+                                    : hi_row;
+    }
+
     uint8_t col_buf[WHD_TEXTURE_COL_HEIGHT];
-    decode_patch_column(col, col_buf);
+    decode_patch_column(col, col_buf, max_row);
+
+    const lighttable_t *cmap = colormaps + 256 * dc_colormap_index;
+
+    uint8_t *dest = &I_VideoBuffer[yl * DOOM_W + dc_x];
+    for (int y = yl; y <= yh; y++) {
+        *dest = cmap[col_buf[(frac >> FRACBITS) & 127]];
+        dest += DOOM_W;
+        frac += fracstep;
+    }
+}
+
+/* ---------- Sky pre-decode cache --------------------------------
+ * PDCOL_SKY paints ~240 columns per frame, each with up to ~100 rows
+ * of sequential Huffman decode in decode_patch_column. The sky
+ * texture is constant per level, viewangle rotation just shifts
+ * which source columns are sampled, so caching the decoded columns
+ * across frames eliminates ~24k Huffman decodes/frame after warmup.
+ *
+ * Storage budget: SKY_CACHE_MAX_COLS * 128 = 32 KB. Sky patches in
+ * vanilla Doom are 256 wide; if anything wider ever appears we just
+ * fall back to the per-frame decode path. */
+#define SKY_CACHE_MAX_COLS 256
+static int     sky_cache_patch = -1;
+static int     sky_cache_width;
+static uint8_t sky_cache_data[SKY_CACHE_MAX_COLS][WHD_TEXTURE_COL_HEIGHT];
+static uint8_t sky_cache_valid[SKY_CACHE_MAX_COLS];
+
+static void paint_sky_column(void)
+{
+    int real_id = dc_source.real_id;
+    if (real_id >= 0) {
+        /* Sky should always come through pd_add_column2 which negates
+         * to a direct patch handle. Defensive fallback. */
+        paint_textured_column(COLOUR_SKY);
+        return;
+    }
+    int patch_num = -real_id;
+
+    if (patch_num != sky_cache_patch) {
+        load_patch_decoder(patch_num);
+        if (cached_width <= 0) return;
+        if (cached_width > SKY_CACHE_MAX_COLS) {
+            /* Wider than our cache - skip caching, just paint. */
+            paint_textured_column(COLOUR_SKY);
+            return;
+        }
+        sky_cache_patch = patch_num;
+        sky_cache_width = cached_width;
+        memset(sky_cache_valid, 0, sizeof sky_cache_valid);
+    }
+
+    int col = dc_source.col;
+    if (col >= sky_cache_width) col %= sky_cache_width;
+
+    if (!sky_cache_valid[col]) {
+        load_patch_decoder(patch_num);
+        decode_patch_column(col, sky_cache_data[col],
+                            WHD_TEXTURE_COL_HEIGHT - 1);
+        sky_cache_valid[col] = 1;
+    }
 
     int yl = dc_yl, yh = dc_yh;
     if (yl < 0) yl = 0;
@@ -493,8 +598,12 @@ static void paint_textured_column(uint8_t fallback_colour)
 
     fixed_t fracstep = dc_iscale;
     fixed_t frac = dc_texturemid + (yl - centery) * fracstep;
-    const lighttable_t *cmap = colormaps + 256 * dc_colormap_index;
+    /* Sky always uses colormap 0 (full bright); colormaps[0..255] is
+     * the identity map in PLAYPAL terms, so a direct write would
+     * also be correct, but keep the lookup symmetric with walls. */
+    const lighttable_t *cmap = colormaps;
 
+    const uint8_t *col_buf = sky_cache_data[col];
     uint8_t *dest = &I_VideoBuffer[yl * DOOM_W + dc_x];
     for (int y = yl; y <= yh; y++) {
         *dest = cmap[col_buf[(frac >> FRACBITS) & 127]];
@@ -524,10 +633,9 @@ void pd_add_column(pd_column_type type)
              * perspective), dc_colormap_index = 0 (full bright), and
              * dc_texturemid = skytexturemid, then routes through
              * pd_add_column2 which converts dc_source to a negative
-             * patch handle. paint_textured_column already handles
-             * exactly that shape - identical to a wall column with
-             * different scale/light. */
-            paint_textured_column(COLOUR_SKY);
+             * patch handle. Specialize the paint to use the sky cache
+             * - skips the per-frame Huffman decode after warmup. */
+            paint_sky_column();
             return;
         default: return; /* MASKED, NONE, etc. -- skip */
     }
@@ -675,15 +783,53 @@ static void render_queued_column(const sprite_queued_column_t *q,
     int col = q->col;
     if (col >= cached_width) col %= cached_width;
 
+    fixed_t fracstep_pre = q->iscale;
+
+    /* Compute the highest col_buf[] row touched across all segments
+     * of this queued column. Each segment shifts the texturemid by
+     * base_off rows, so each gets its own frac range; we take the
+     * union. If any segment wraps the 128-row boundary or spans more
+     * than 128 rows, fall back to full decode. */
+    int max_row = 0;
+    int need_full = 0;
+    {
+        const uint8_t *ys = &seg_buf[q->seg_offset];
+        for (int s = 0; s < q->seg_count; s++) {
+            int yl = ys[s * 3];
+            int yh = ys[s * 3 + 1];
+            int base_off = ys[s * 3 + 2];
+            if (yh > DOOM_H - 1) yh = DOOM_H - 1;
+            if (yl > yh) continue;
+            fixed_t tex_mid_seg =
+                q->texturemid - ((fixed_t)base_off << FRACBITS);
+            fixed_t frac0 = tex_mid_seg + (yl - centery) * fracstep_pre;
+            int span_rows = yh - yl;
+            int64_t span_frac = (int64_t)span_rows * (int64_t)fracstep_pre;
+            int64_t span_abs = span_frac < 0 ? -span_frac : span_frac;
+            if (span_abs >= ((int64_t)WHD_TEXTURE_COL_HEIGHT << FRACBITS)) {
+                need_full = 1; break;
+            }
+            fixed_t frac_end = frac0 + (fixed_t)span_frac;
+            fixed_t lo = (frac0 < frac_end) ? frac0 : frac_end;
+            fixed_t hi = (frac0 < frac_end) ? frac_end : frac0;
+            int lo_row = (int)((lo >> FRACBITS) & (WHD_TEXTURE_COL_HEIGHT - 1));
+            int hi_row = (int)((hi >> FRACBITS) & (WHD_TEXTURE_COL_HEIGHT - 1));
+            if (lo_row > hi_row) { need_full = 1; break; }
+            if (hi_row > max_row) max_row = hi_row;
+        }
+    }
+    if (need_full) max_row = WHD_TEXTURE_COL_HEIGHT - 1;
+
     uint8_t col_buf[WHD_TEXTURE_COL_HEIGHT];
-    decode_patch_column(col, col_buf);
+    decode_patch_column(col, col_buf, max_row);
 
     /* Player-colour translation - same formula pd_render.cpp:
      * draw_patch_columns uses for the 0x70-range green marine
-     * pixels. */
+     * pixels. Bounded by max_row since rows above that aren't
+     * decoded and aren't sampled. */
     if (q->translation_index) {
         int tbase = 0x80 - (int)q->translation_index * 0x20;
-        for (int yy = 0; yy < WHD_TEXTURE_COL_HEIGHT; yy++) {
+        for (int yy = 0; yy <= max_row; yy++) {
             if ((col_buf[yy] >> 4) == 7) {
                 col_buf[yy] = (uint8_t)(tbase + (col_buf[yy] & 0x0f));
             }
@@ -744,12 +890,14 @@ static void drain_sprite_queues(void)
  * E1M1's view typically shows 2-3 distinct flats at a time (CEIL5_1
  * + FLOOR4_8 + FLOOR0_1 ish), so a 4-slot LRU keeps the steady state
  * decode-free. */
-#define FLAT_CACHE_SLOTS 4
+#define FLAT_CACHE_SLOTS 8
 #define FLAT_PIXELS      4096
 
 static uint8_t flat_cache[FLAT_CACHE_SLOTS][FLAT_PIXELS];
-static int     flat_cache_picnum[FLAT_CACHE_SLOTS] = {-1, -1, -1, -1};
-static uint8_t flat_cache_lru[FLAT_CACHE_SLOTS] = {0, 1, 2, 3};
+static int     flat_cache_picnum[FLAT_CACHE_SLOTS] =
+    {-1, -1, -1, -1, -1, -1, -1, -1};
+static uint8_t flat_cache_lru[FLAT_CACHE_SLOTS] =
+    {0, 1, 2, 3, 4, 5, 6, 7};
 
 static void decode_flat(int picnum, uint8_t *dst)
 {
@@ -857,6 +1005,18 @@ static const uint8_t *load_flat(int picnum)
 static int     plane_light_cached_fd = -1;
 static uint8_t plane_light_level[MAIN_VIEWHEIGHT];
 
+/* Per-column cache of cos(angle(x)) * distscale(x) and
+ * sin(angle(x)) * distscale(x). These depend only on viewangle and
+ * x, both frame-constant, so the same value is reused across every
+ * visplane (typically floor + ceiling, sometimes more) that touches
+ * column x. Filled lazily on first access; the validity bitmap is
+ * cleared in pd_begin_frame.
+ *
+ * Storage: 320 * (4 + 4 + 1) = 2880 B BSS. */
+static fixed_t plane_xcos[DOOM_W];
+static fixed_t plane_xsin[DOOM_W];
+static uint8_t plane_xcache_valid[DOOM_W];
+
 void pd_add_plane_column(int x, int yl, int yh, fixed_t scale,
                          int floor, int fd_num)
 {
@@ -923,16 +1083,20 @@ void pd_add_plane_column(int x, int yl, int yh, fixed_t scale,
      *   world_x   = viewx + cos_a * length          = viewx + Kx * yslope[y]
      *   world_y   = -viewy - sin_a * length         = -viewy - Ky * yslope[y]
      * with Kx = cos_a * plane_h * dscale, Ky = sin_a * plane_h * dscale.
-     * This drops the per-pixel mul count from 4 (distance, length,
-     * world_x, world_y) to 2 (world_x, world_y). distance is no longer
-     * needed because the lighting cache above already absorbed it. */
-    angle_t angle  = (viewangle + x_to_viewangle(x)) >> ANGLETOFINESHIFT;
-    fixed_t cos_a  = finecosine(angle);
-    fixed_t sin_a  = finesine(angle);
-    fixed_t dscale = distscale(x);
-    fixed_t k      = FixedMul(plane_h, dscale);
-    fixed_t kx     = FixedMul(cos_a, k);
-    fixed_t ky     = FixedMul(sin_a, k);
+     * cos_a*dscale and sin_a*dscale depend only on viewangle and x, so
+     * they're shared across every visplane that touches this column;
+     * cache them per frame and only multiply by plane_h here. */
+    if (!plane_xcache_valid[x]) {
+        angle_t angle  = (viewangle + x_to_viewangle(x)) >> ANGLETOFINESHIFT;
+        fixed_t cos_a  = finecosine(angle);
+        fixed_t sin_a  = finesine(angle);
+        fixed_t dscale = distscale(x);
+        plane_xcos[x] = FixedMul(cos_a, dscale);
+        plane_xsin[x] = FixedMul(sin_a, dscale);
+        plane_xcache_valid[x] = 1;
+    }
+    fixed_t kx = FixedMul(plane_xcos[x], plane_h);
+    fixed_t ky = FixedMul(plane_xsin[x], plane_h);
 
     uint8_t *dest = &I_VideoBuffer[yl * DOOM_W + x];
     for (int y = yl; y <= yh; y++) {
@@ -1063,6 +1227,9 @@ void pd_begin_frame(void)
      * reused across frames for unrelated visplanes, so drop the cache
      * on every new frame to avoid serving stale `level[y]` profiles. */
     plane_light_cached_fd = -1;
+    /* Per-column cos*dscale / sin*dscale cache depends on viewangle,
+     * which can change every frame. Drop validity. */
+    memset(plane_xcache_valid, 0, sizeof plane_xcache_valid);
     wipe_min = 0;
 }
 
@@ -1192,6 +1359,88 @@ static void install_playpal(void)
     installed = 1;
 }
 
+/* ---------- Large FPS overlay -----------------------------------
+ * Engine ST_FpsDrawer paints 4-px-tall digits at (318, 2) which is
+ * unreadable on the click panel. Overlay our own 5x7 bitmap font
+ * scaled 3x at the top-right after V_DrawPatchList drains; backed
+ * by a 1-px black inset for contrast against any sky/wall colour.
+ * Drawn into the 320-wide framebuffer; the SPI converter drops one
+ * column in four, but at 3x scale each glyph cell is 3 source cols
+ * so character pixels stay visible (worst case 2/3 source cols
+ * reach the panel per glyph cell, plenty for legibility). */
+extern boolean show_fps;
+
+static const uint8_t fps_font[10][7] = {
+    /* 0 */ { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E },
+    /* 1 */ { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E },
+    /* 2 */ { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F },
+    /* 3 */ { 0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E },
+    /* 4 */ { 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 },
+    /* 5 */ { 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E },
+    /* 6 */ { 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E },
+    /* 7 */ { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 },
+    /* 8 */ { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E },
+    /* 9 */ { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C },
+};
+
+#define FPS_GLYPH_SCALE 3
+#define FPS_GLYPH_W     (5 * FPS_GLYPH_SCALE)
+#define FPS_GLYPH_H     (7 * FPS_GLYPH_SCALE)
+#define FPS_GLYPH_GAP   FPS_GLYPH_SCALE
+#define FPS_DIGIT_FG    4    /* PLAYPAL: bright off-white */
+#define FPS_DIGIT_BG    0    /* PLAYPAL: black */
+
+static void fps_paint_digit(int x, int y, int d)
+{
+    if (d < 0 || d > 9) return;
+    for (int row = 0; row < 7; row++) {
+        uint8_t bits = fps_font[d][row];
+        for (int col = 0; col < 5; col++) {
+            if (!(bits & (1 << (4 - col)))) continue;
+            int px = x + col * FPS_GLYPH_SCALE;
+            int py = y + row * FPS_GLYPH_SCALE;
+            for (int sy = 0; sy < FPS_GLYPH_SCALE; sy++) {
+                int yy = py + sy;
+                if ((unsigned)yy >= (unsigned)DOOM_H) continue;
+                uint8_t *p = &I_VideoBuffer[yy * DOOM_W + px];
+                for (int sx = 0; sx < FPS_GLYPH_SCALE; sx++) {
+                    int xx = px + sx;
+                    if ((unsigned)xx < (unsigned)DOOM_W) p[sx] = FPS_DIGIT_FG;
+                }
+            }
+        }
+    }
+}
+
+static void draw_big_fps(int fps)
+{
+    if (fps < 0)   fps = 0;
+    if (fps > 999) fps = 999;
+    int n = (fps >= 100) ? 3 : (fps >= 10) ? 2 : 1;
+    int total_w = n * FPS_GLYPH_W + (n - 1) * FPS_GLYPH_GAP;
+
+    int x = DOOM_W - 4 - total_w;
+    int y = 2;
+
+    /* Black inset for contrast - 1 px past each edge of the glyph
+     * cluster. */
+    for (int yy = y - 1; yy < y + FPS_GLYPH_H + 1; yy++) {
+        if ((unsigned)yy >= (unsigned)DOOM_H) continue;
+        uint8_t *row = &I_VideoBuffer[yy * DOOM_W];
+        for (int xx = x - 2; xx < x + total_w + 2; xx++) {
+            if ((unsigned)xx < (unsigned)DOOM_W) row[xx] = FPS_DIGIT_BG;
+        }
+    }
+
+    int cx = x;
+    int divisors[3] = {100, 10, 1};
+    int start = 3 - n;
+    for (int i = start; i < 3; i++) {
+        fps_paint_digit(cx, y, (fps / divisors[i]) % 10);
+        cx += FPS_GLYPH_W + FPS_GLYPH_GAP;
+    }
+}
+
 void pd_end_frame(int wipe_start)
 {
     install_playpal();
@@ -1233,19 +1482,17 @@ void pd_end_frame(int wipe_start)
          * when tic builds drop out (long wipe loops, frame stalls). */
         button_tick();
 
-        /* FPS overlay. ST_FpsDrawer is a no-op when show_fps is false;
-         * either user button toggles show_fps via i_input_stm32. The
-         * widget lives at (318, 2) - top-right corner above the view.
-         *
-         * We compute fps ourselves over a 1-second window of frames
-         * and pass it explicitly: ST_FpsDrawer's auto-mode (fps == -1)
-         * caps individual frame deltas at < 100 ms, which silently
-         * rejects every sample at our ~10 fps rate (delta = 100 ms
-         * exactly), leaving the widget stuck at 0 forever. */
+        /* FPS overlay. We compute fps ourselves over a 1-second window
+         * and feed it both to the engine widget (small digits at
+         * (318, 2)) and to our larger top-right overlay drawn after
+         * V_DrawPatchList. ST_FpsDrawer's auto-mode (fps == -1) caps
+         * frame deltas at < 100 ms, which silently rejects samples at
+         * our ~28 ms/frame rate, so we always pass the value
+         * explicitly. The drawer is a no-op when show_fps is false. */
+        static int fps_value;
         {
             static int frames_in_window;
             static int window_start_ms;
-            static int fps_value;
             int now = I_GetTimeMS();
             frames_in_window++;
             int elapsed = now - window_start_ms;
@@ -1260,6 +1507,13 @@ void pd_end_frame(int wipe_start)
         /* Drain the patchlist into I_VideoBuffer (dest_screen was pointed
          * here by V_RestoreBuffer in d_main.c before the game loop). */
         V_DrawPatchList(vpatchlists->framebuffer);
+
+        /* Large FPS overlay on top of everything. The engine's built-in
+         * widget at (318, 2) is too small to read on the click panel;
+         * paint our own 3x-scaled bitmap font at the top-right. */
+        if (show_fps) {
+            draw_big_fps(fps_value);
+        }
 
         if (wipe_start) {
             /* Gamestate just changed. I_VideoBuffer holds the new
