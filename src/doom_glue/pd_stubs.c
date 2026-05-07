@@ -1476,6 +1476,17 @@ void pd_end_frame(int wipe_start)
         /* Menu (only renders when menuactive); no-op in attract demo. */
         M_Drawer();
 
+        /* Advance the pre-wipe state machine one frame. g_game.c
+         * holds back ga_newgame / ga_loadlevel / ga_completed /
+         * ga_worlddone gameactions for one render frame so the menu
+         * (or last-frame HUD) gets drawn once with the action pending,
+         * then the gameaction runs on the *next* tic. The original
+         * pd_render.cpp advances NEEDED -> DONE here; without this
+         * the menu's "select skill" never closes into the level. */
+        if (pre_wipe_state == PRE_WIPE_EXTRA_FRAME_NEEDED) {
+            pre_wipe_state = PRE_WIPE_EXTRA_FRAME_DONE;
+        }
+
         /* Poll the wolfDemo user buttons every render frame. I_StartTic
          * also polls them, but only fires from the engine's tic builder
          * - per-frame polling here guarantees the press is caught even
