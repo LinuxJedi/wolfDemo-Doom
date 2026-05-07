@@ -8,9 +8,11 @@
  * The wolfDemo board has two general-purpose push-buttons wired to
  * PB4 (SW2 / BT1) and PB5 (SW4 / BT2), both with external 10K
  * pull-ups to VDD - so the input idles high and reads low while
- * pressed. Either button toggles the engine's built-in FPS counter
- * (`show_fps`); the four LEDs are reserved for the SFX VU meter so
- * we don't piggyback any GPIO confirmation here.
+ * pressed. SW2 toggles the FPS overlay (show_fps); SW4 toggles OPL
+ * music on/off (I_EnableMusic) so the user can trade music for ~5
+ * extra FPS when the renderer is the bottleneck. The four LEDs are
+ * reserved for the SFX VU meter so we don't piggyback any GPIO
+ * confirmation here.
  *
  * PB4 happens to be the JTAG NJTRST pin (MODER reset value 10 = AF).
  * Writing MODER bits 8-9 to 00 (input) overrides the JTAG TAP and
@@ -35,6 +37,9 @@
 #include "doomkeys.h"
 
 extern bool show_fps;
+extern void I_EnableMusic(int enable);
+
+static int music_on = 1;
 
 static uint8_t  btn_prev_state;  /* bit0 = BTN1 pressed last sample,
                                   * bit1 = BTN2 pressed last sample */
@@ -132,12 +137,16 @@ void button_tick(void)
 {
     btn_init();
     uint32_t idr = BTN_PORT->IDR;
-    uint8_t  cur = (uint8_t)((((~idr) >> BTN1_PIN) & 1u)        /* bit0 */
-                           | ((((~idr) >> BTN2_PIN) & 1u) << 1));/* bit1 */
-    /* Either button - rising edge of pressed state. */
+    uint8_t  cur = (uint8_t)((((~idr) >> BTN1_PIN) & 1u)        /* bit0 = SW2 */
+                           | ((((~idr) >> BTN2_PIN) & 1u) << 1));/* bit1 = SW4 */
+    /* Rising edge per button (LOW -> HIGH transition of "pressed"). */
     uint8_t newly_pressed = cur & ~btn_prev_state;
-    if (newly_pressed) {
+    if (newly_pressed & 0x1) {
         show_fps = !show_fps;
+    }
+    if (newly_pressed & 0x2) {
+        music_on = !music_on;
+        I_EnableMusic(music_on);
     }
     btn_prev_state = cur;
 
