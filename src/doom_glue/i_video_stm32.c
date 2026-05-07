@@ -36,6 +36,7 @@
 #include "../st7789.h"
 #include "../spi.h"
 #include "../uart.h"
+#include "w_wad.h"
 
 #define DOOM_W 320
 #define DOOM_H 200
@@ -69,14 +70,50 @@ void I_InitGraphics(void)
 
 void I_ShutdownGraphics(void) { /* nothing */ }
 
-/* The engine's PLAYPAL lump holds 14 256-entry palettes (normal, 8
- * damage tints, bonus, and 4 power-up). I_SetPaletteNum picks one by
- * index. Until we wire up access to the cached PLAYPAL lump, treat
- * any non-zero index as the same as index 0 -- the panel won't tint
- * during damage / item pickup, but the title screen still renders. */
+void I_SetPalette(const uint8_t *palette);
+
+/* The engine's ST_doPaletteStuff picks a tinted palette each tic to
+ * drive screen flashes (8 red damage tints, 4 gold bonus-pickup tints,
+ * green radsuit). Vanilla Doom stores all 14 768-byte palettes in the
+ * PLAYPAL lump, but the WHD generator (whd_gen.cpp:4785) truncates
+ * PLAYPAL to a single 768-byte copy of palette 0 because the rest
+ * are derivable from it via ColorShiftPalette. We apply the same
+ * derivation here on-board: palette 0 is straight PLAYPAL; tinted
+ * palettes interpolate each PLAYPAL[0] color toward a target tint
+ * by shift/steps. Cache the PLAYPAL pointer on first call. */
 void I_SetPaletteNum(int num)
 {
-    (void)num;
+    static const uint8_t *cached_playpal;
+    if (!cached_playpal) {
+        int pnum = W_CheckNumForName("PLAYPAL");
+        if (pnum < 0) return;
+        cached_playpal = (const uint8_t *)W_CacheLumpNum(pnum, 0);
+        if (!cached_playpal) return;
+    }
+    if (num == 0) {
+        I_SetPalette(cached_playpal);
+        return;
+    }
+    int tr, tg, tb, shift, steps;
+    if (num < 9)        { tr = 255; tg = 0;   tb = 0;  shift = num;     steps = 9; }
+    else if (num < 13)  { tr = 215; tg = 186; tb = 69; shift = num - 8; steps = 8; }
+    else                { tr = 0;   tg = 256; tb = 0;  shift = 1;       steps = 8; }
+    const uint8_t *src = cached_playpal;
+    for (int i = 0; i < 256; i++) {
+        int r = src[i * 3 + 0];
+        int g = src[i * 3 + 1];
+        int b = src[i * 3 + 2];
+        r += (tr - r) * shift / steps;
+        g += (tg - g) * shift / steps;
+        b += (tb - b) * shift / steps;
+        if (r < 0) r = 0; else if (r > 255) r = 255;
+        if (g < 0) g = 0; else if (g > 255) g = 255;
+        if (b < 0) b = 0; else if (b > 255) b = 255;
+        uint16_t rgb565 = (uint16_t)(((r & 0xF8) << 8) |
+                                     ((g & 0xFC) << 3) |
+                                     ((b & 0xF8) >> 3));
+        palette_rgb565[i] = (uint16_t)((rgb565 << 8) | (rgb565 >> 8));
+    }
 }
 
 void I_SetPalette(const uint8_t *palette)
