@@ -6,12 +6,15 @@
  *
  * --- Output stage ----------------------------------------------------
  * DAC1 channel 1 on PA4 (analog mode, output buffer enabled, normal
- * mode) drives an external passive RC + speaker. TIM6 generates an
+ * mode) drives an external amplified speaker. TIM6 generates an
  * update interrupt at 11025 Hz; the TIM6_IRQHandler reads the next
- * sample from a 1024-byte circular ring buffer and writes it to
- * DAC1->DHR8R1 directly. When the read pointer crosses the half-
- * buffer or full-buffer boundary, the IRQ also runs the mixer to
- * refill the consumed half.
+ * sample from a 1024-sample (16-bit) circular ring buffer and writes
+ * it to DAC1->DHR12R1. We use 12-bit mode (vs 8-bit) so that low Doom
+ * volumes still have enough resolution to avoid audible quantization
+ * grit; combined with the >>MIX_OUTPUT_SHIFT master attenuation below,
+ * it brings the line-level swing down to a sane figure for an external
+ * amp. When the read pointer crosses the half-buffer or full-buffer
+ * boundary, the IRQ also runs the mixer to refill the consumed half.
  *
  * We landed on this IRQ-per-sample approach after multiple DMA
  * attempts ran into bus errors:
@@ -25,7 +28,7 @@
  *    rejected the access for some reason we couldn't pin down on
  *    this board.
  *
- * The CPU itself can write DAC1->DHR8R1 fine (we use it during
+ * The CPU itself can write DAC1->DHR12R1 fine (we use it during
  * audio_hw_init to pre-load mid-rail), so an IRQ-driven path that
  * just writes one register per timer tick avoids the whole DMA
  * mystery. Cost: 11025 IRQs/sec * ~50 cycles ~= 550K cycles/s ~=
@@ -54,9 +57,9 @@
  * through the block sample by sample with a fixed-point fractional
  * offset (channel->offset is a 16.16 index so playback rate can be
  * pitched up or down). Samples are signed 8-bit; per-channel volume
- * is 0..127. The mixer sums into an int32 accumulator, scales by
- * /512 to fold 8 channels into the 8-bit DAC range, and stores
- * uint8 = clamped + 0x80.
+ * is 0..127. The mixer sums into an int32 accumulator, shifts right
+ * by MIX_OUTPUT_SHIFT to scale into the 12-bit DAC range (with
+ * built-in master attenuation), and stores uint16 = clamped + 0x800.
  *
  * The same single-pole IIR low-pass filter as i_picosound.c is
  * applied per-channel (alpha256 cached at StartSound time based on
@@ -105,13 +108,26 @@
 #define ADPCM_BLOCK_SIZE              128
 #define ADPCM_SAMPLES_PER_BLOCK_SIZE  249
 #define MIX_VOL_DIVISOR               4   /* (left+right)/4 -> 0..127 */
-/* Output shift: scale the int32 accumulator into the 8-bit DAC range.
+/* Output shift: scale the int32 accumulator into the 12-bit DAC range
+ * with a master digital attenuator built in.
+ *
  * Max single-channel mix = (sample max) * (vol max) = 127 * 127 ~= 16K.
- * Max 8-channel = ~128K. >>7 gives ~127 max per channel and clips
- * when many channels hit full amplitude simultaneously, which sounds
- * better than the inaudible >>9 we tried first (typical SFX peak
- * landed at ~5 with >>9, below any sensible VU threshold). */
-#define MIX_OUTPUT_SHIFT              7
+ * Max 8-channel = ~128K. The 12-bit signed range is +-2048.
+ *
+ * - >>3 lands a single channel at full amplitude near the top of the
+ *   12-bit range (16K/8 = 2K) - rail-to-rail, same loudness as the
+ *   prior 8-bit setup.
+ * - >>6 cuts that to ~12.5% of full scale (16K/64 = 256 -> ~0.4 V peak
+ *   on a 3.3 V DAC), which is in line-level territory and well-matched
+ *   to an external amplified speaker.
+ *
+ * Default >>6 trades absolute loudness for headroom; because the DAC
+ * is now 12-bit, low Doom volumes still have ~16x more codes than
+ * before so quantization grit is gone even with the digital attenuation.
+ * Drop to >>5 for ~6 dB louder, raise to >>7 for ~6 dB quieter. */
+#define MIX_OUTPUT_SHIFT              6
+#define DAC_BIAS_12BIT                0x800u   /* 12-bit mid-rail */
+#define DAC_PEAK_12BIT                0x7FFu   /* +-2047 around bias */
 
 typedef struct channel_s {
     const uint8_t *data;        /* current ADPCM read pointer */
@@ -133,8 +149,9 @@ static bool      use_sfx_prefix;
  * The TIM6 IRQ reads sequentially; each chunk-boundary crossing
  * triggers a mix into the consumed half. ring_rd is incremented
  * inside the IRQ only - main-thread writers (I_StartSound etc.)
- * don't touch it. */
-static uint8_t            ring_buf[RING_SAMPLES] __attribute__((aligned(4)));
+ * don't touch it. Samples are 12-bit unsigned (DAC code), biased at
+ * DAC_BIAS_12BIT for silence. */
+static uint16_t           ring_buf[RING_SAMPLES] __attribute__((aligned(4)));
 static volatile uint16_t  ring_rd;
 
 /* --- ADPCM decode (lifted from doom/src/pico/i_picosound.c) ------- */
@@ -220,21 +237,20 @@ static void decompress_buffer(channel_t *ch)
 
 /* --- VU meter ------------------------------------------------------ */
 /* Four-bucket VU meter on LED1..LED4 (cumulative). Each chunk's peak
- * abs amplitude (post-scale, pre-offset; range 0..127) is bucketed
- * into four thresholds and the LEDs light progressively with louder
- * mixes. Silence = no LEDs lit. The thresholds were tuned for typical
- * Doom SFX volume after the >>7 mix scaling: a single channel at
- * default volume (vol ~= 30, sample peak ~= 80) lands around peak
- * ~= 18, lighting LED1+LED2; a gunshot or scream at higher volume
- * lights all four. */
+ * abs amplitude (post-shift, pre-clamp; range 0..2047 in the 12-bit
+ * domain) is bucketed into four thresholds and the LEDs light
+ * progressively with louder mixes. Silence = no LEDs lit. The
+ * thresholds are 2x the prior 8-bit values so that a single channel
+ * at full volume still lights LED4 (single-channel peak with the
+ * default >>6 master shift = ~256, so 144 lights LED4). */
 static void vu_set(int peak)
 {
     uint32_t bsrr = 0;
     int leds_lit = 0;
-    if (peak >=  3) leds_lit = 1;
-    if (peak >= 12) leds_lit = 2;
-    if (peak >= 32) leds_lit = 3;
-    if (peak >= 72) leds_lit = 4;
+    if (peak >=   6) leds_lit = 1;
+    if (peak >=  24) leds_lit = 2;
+    if (peak >=  64) leds_lit = 3;
+    if (peak >= 144) leds_lit = 4;
     for (int i = 0; i < 4; i++) {
         int pin = LED1_PIN + i;
         if (i < leds_lit) bsrr |= (1u << pin);
@@ -244,7 +260,7 @@ static void vu_set(int peak)
 }
 
 /* --- Mixer ---------------------------------------------------------- */
-static void mix_chunk(uint8_t *out, int n)
+static void mix_chunk(uint16_t *out, int n)
 {
     int32_t mix_buf[HALF_SAMPLES];
     for (int s = 0; s < n; s++) mix_buf[s] = 0;
@@ -291,9 +307,9 @@ static void mix_chunk(uint8_t *out, int n)
         int v = mix_buf[s] >> MIX_OUTPUT_SHIFT;
         int a = v < 0 ? -v : v;
         if (a > peak) peak = a;
-        if (v < -128) v = -128;
-        else if (v > 127) v = 127;
-        out[s] = (uint8_t)(v + 128);
+        if (v < -(int)(DAC_PEAK_12BIT + 1)) v = -(int)(DAC_PEAK_12BIT + 1);
+        else if (v > (int)DAC_PEAK_12BIT)   v =  (int)DAC_PEAK_12BIT;
+        out[s] = (uint16_t)(v + (int)DAC_BIAS_12BIT);
     }
     vu_set(peak);
 }
@@ -337,14 +353,14 @@ static void audio_hw_init(void)
                                                next DHR8R1 write takes
                                                effect immediately */
     /* Pre-load mid-rail so the speaker is biased before the IRQ runs. */
-    DAC1->DHR8R1 = 0x80;
+    DAC1->DHR12R1 = DAC_BIAS_12BIT;
     DAC1->CR |= DAC_CR_EN1;
     __asm volatile ("dsb" ::: "memory");
     for (volatile int i = 0; i < 1000; i++) { __asm volatile (""); }
 
     /* Pre-fill the ring with silence so the IRQ has good data the
      * moment TIM6 starts firing. */
-    for (int i = 0; i < RING_SAMPLES; i++) ring_buf[i] = 0x80;
+    for (int i = 0; i < RING_SAMPLES; i++) ring_buf[i] = DAC_BIAS_12BIT;
 
     /* TIM6: APB1 timer clock = SYSCLK (160 MHz with our PLL). Period
      * = 160e6 / 11025 ~= 14512.5 -> ARR = 14512 - 1, fclk ~= 11025.5 Hz.
@@ -369,7 +385,7 @@ static void audio_hw_init(void)
 }
 
 /* TIM6 update IRQ. Fires at AUDIO_SAMPLE_RATE Hz; pushes one sample
- * into DAC1->DHR8R1 and advances the ring read pointer. At chunk
+ * into DAC1->DHR12R1 and advances the ring read pointer. At chunk
  * boundaries (sample HALF_SAMPLES-1 or RING_SAMPLES-1) it kicks the
  * mixer to refill the half that was just consumed. mix_chunk also
  * updates the LED VU meter for the chunk just produced. */
@@ -379,7 +395,7 @@ void TIM6_IRQHandler(void)
     TIM6->SR = 0;
 
     uint16_t rd = ring_rd;
-    DAC1->DHR8R1 = ring_buf[rd];
+    DAC1->DHR12R1 = ring_buf[rd];
     rd++;
     if (rd == HALF_SAMPLES) {
         mix_chunk(&ring_buf[0], HALF_SAMPLES);
@@ -430,7 +446,7 @@ void I_ShutdownSound(void)
     NVIC_DisableIRQ(TIM6_IRQn);
     TIM6->CR1  = 0;
     TIM6->DIER = 0;
-    DAC1->DHR8R1 = 0x80;
+    DAC1->DHR12R1 = DAC_BIAS_12BIT;
     sound_initialized = false;
 }
 
