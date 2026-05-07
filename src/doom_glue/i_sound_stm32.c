@@ -259,11 +259,31 @@ static void vu_set(int peak)
     LED_PORT->BSRR = bsrr;
 }
 
+/* OPL music mixed in alongside SFX. Defined in i_music_stm32.c;
+ * fills `out` with mono int16 samples at MUSIC_SAMPLE_RATE (matches
+ * AUDIO_SAMPLE_RATE) and silently fills with zeros if music isn't
+ * initialised, so we can call it unconditionally each chunk. */
+extern void music_render_chunk(int16_t *out, int n);
+
 /* --- Mixer ---------------------------------------------------------- */
 static void mix_chunk(uint16_t *out, int n)
 {
     int32_t mix_buf[HALF_SAMPLES];
-    for (int s = 0; s < n; s++) mix_buf[s] = 0;
+    int16_t music_buf[HALF_SAMPLES];
+
+    music_render_chunk(music_buf, n);
+
+    /* OPL output is int16 (-32768..32767). The SFX accumulator
+     * (mix_buf) holds sample*vol per channel, single-channel peak
+     * ~+-16K, 8-channel peak ~+-128K. Then MIX_OUTPUT_SHIFT (6) maps
+     * to +-2047 12-bit range. We seed mix_buf with music scaled down
+     * to ~+-8K (>> 2): post-shift that's +-128, sitting comfortably
+     * at line level - lower than peak SFX, matching the engine's
+     * "music as background, SFX as foreground" mix. Adjust MUSIC_SHIFT
+     * if the balance feels off in practice. */
+    #define MUSIC_SHIFT 2
+    for (int s = 0; s < n; s++)
+        mix_buf[s] = (int32_t)music_buf[s] >> MUSIC_SHIFT;
 
     for (int ci = 0; ci < NUM_SOUND_CHANNELS; ci++) {
         channel_t *ch = &channels[ci];
@@ -377,6 +397,18 @@ static void audio_hw_init(void)
     TIM6->DIER  = TIM_DIER_UIE;        /* update interrupt enable */
 
     NVIC_ClearPendingIRQ(TIM6_IRQn);
+    /* TIM6 fires per-sample at 11025 Hz; the per-sample handler must
+     * be lean (DAC write + pointer advance) so we keep it at the
+     * default high priority. The chunk refill (which now includes
+     * OPL music synthesis at ~10 ms/chunk) is deferred to PendSV at
+     * the lowest priority so SPI-TC, SysTick, and follow-up TIM6
+     * sample firings can all preempt it. Without this split, music
+     * synth blocked the GPDMA1 TC interrupt that drives the ST7789
+     * blit, collapsing the visible frame rate. */
+    NVIC_SetPriority(TIM6_IRQn, 0);
+    /* PendSV is the canonical "deferred work" Cortex-M handler.
+     * Lowest priority = numerically highest. */
+    NVIC_SetPriority(PendSV_IRQn, 0xFF);
     NVIC_EnableIRQ(TIM6_IRQn);
 
     __asm volatile ("dsb" ::: "memory");
@@ -384,11 +416,19 @@ static void audio_hw_init(void)
     TIM6->CR1 = TIM_CR1_CEN;
 }
 
+/* Pending refill state. The TIM6 ISR sets a bit per chunk that has
+ * gone empty; PendSV drains the bits and refills the matching half
+ * of the ring. */
+static volatile uint8_t refill_request;
+#define REFILL_LOWER_HALF  0x1u
+#define REFILL_UPPER_HALF  0x2u
+
 /* TIM6 update IRQ. Fires at AUDIO_SAMPLE_RATE Hz; pushes one sample
  * into DAC1->DHR12R1 and advances the ring read pointer. At chunk
- * boundaries (sample HALF_SAMPLES-1 or RING_SAMPLES-1) it kicks the
- * mixer to refill the half that was just consumed. mix_chunk also
- * updates the LED VU meter for the chunk just produced. */
+ * boundaries it pends PendSV to refill the half that just emptied.
+ * Keeping the per-sample path tight (no mix_chunk inline) lets the
+ * music synth in mix_chunk run at low priority without blocking
+ * either subsequent TIM6 firings or SPI-TC / SysTick. */
 void TIM6_IRQHandler(void)
 {
     /* Always clear the update flag first so we don't re-enter. */
@@ -398,12 +438,38 @@ void TIM6_IRQHandler(void)
     DAC1->DHR12R1 = ring_buf[rd];
     rd++;
     if (rd == HALF_SAMPLES) {
-        mix_chunk(&ring_buf[0], HALF_SAMPLES);
+        refill_request |= REFILL_LOWER_HALF;
+        SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
     } else if (rd == RING_SAMPLES) {
-        mix_chunk(&ring_buf[HALF_SAMPLES], HALF_SAMPLES);
+        refill_request |= REFILL_UPPER_HALF;
+        SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
         rd = 0;
     }
     ring_rd = rd;
+}
+
+/* PendSV at lowest priority. Drains pending chunk refills. While
+ * we're synthesising music here, TIM6 sample IRQs continue to fire
+ * (preempting us), GPDMA1 channel-0 TC keeps the SPI blit moving
+ * and SysTick keeps I_GetTimeMS advancing. The 46 ms slack between
+ * a chunk emptying and TIM6 reaching the buddy chunk is plenty to
+ * complete one mix_chunk call (~10 ms music + a few ms SFX). */
+void PendSV_Handler(void)
+{
+    while (refill_request) {
+        uint8_t req;
+        __asm volatile ("cpsid i" ::: "memory");
+        req = refill_request;
+        refill_request = 0;
+        __asm volatile ("cpsie i" ::: "memory");
+
+        if (req & REFILL_LOWER_HALF) {
+            mix_chunk(&ring_buf[0], HALF_SAMPLES);
+        }
+        if (req & REFILL_UPPER_HALF) {
+            mix_chunk(&ring_buf[HALF_SAMPLES], HALF_SAMPLES);
+        }
+    }
 }
 
 /* --- Doom interface ------------------------------------------------- */
@@ -533,15 +599,5 @@ void I_PrecacheSounds(should_be_const sfxinfo_t *sounds, int num_sounds)
     (void)sounds; (void)num_sounds;
 }
 
-/* --- Music: still stubbed. ----------------------------------------- */
-void    I_InitMusic(void)                                       { }
-void    I_ShutdownMusic(void)                                   { }
-void    I_PlaySong(void *handle, boolean looping)               { (void)handle; (void)looping; }
-void    I_PauseSong(void)                                       { }
-void    I_ResumeSong(void)                                      { }
-void    I_StopSong(void)                                        { }
-void    I_UnRegisterSong(void *h)                               { (void)h; }
-void   *I_RegisterSong(should_be_const void *d, int l)          { (void)d; (void)l; return (void *)1; }
-boolean I_MusicIsPlaying(void)                                  { return false; }
-void    I_SetMusicVolume(int v)                                 { (void)v; }
-void    I_SetOPLDriverVer(opl_driver_ver_t ver)                 { (void)ver; }
+/* Music lives in i_music_stm32.c (OPL2 emulator + i_oplmusic.c
+ * driver). I_SetOPLDriverVer comes from i_oplmusic.c itself. */

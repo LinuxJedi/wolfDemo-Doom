@@ -29,6 +29,7 @@ C_SRCS := \
     src/doom_glue/i_video_stm32.c \
     src/doom_glue/i_input_stm32.c \
     src/doom_glue/i_sound_stm32.c \
+    src/doom_glue/i_music_stm32.c \
     src/doom_glue/i_timer_stm32.c \
     src/doom_glue/i_system_stm32.c \
     src/doom_glue/pd_stubs.c \
@@ -116,7 +117,10 @@ DOOM_SRCS := \
     doom/src/doom/st_lib.c \
     doom/src/doom/st_stuff.c \
     doom/src/doom/statdump.c \
-    doom/src/doom/wi_stuff.c
+    doom/src/doom/wi_stuff.c \
+    doom/src/i_oplmusic.c \
+    doom/opl/opl3.c \
+    doom/opl/opl_queue.c
 
 C_SRCS += $(DOOM_SRCS)
 
