@@ -119,7 +119,7 @@ DOOM_SRCS := \
     doom/src/doom/statdump.c \
     doom/src/doom/wi_stuff.c \
     doom/src/i_oplmusic.c \
-    doom/opl/opl3.c \
+    doom/opl/emu8950.c \
     doom/opl/opl_queue.c
 
 C_SRCS += $(DOOM_SRCS)
@@ -237,7 +237,20 @@ DOOM_DEFINES := \
     -DNO_Z_MALLOC_USER_PTR=1 \
     -DTEMP_IMMUTABLE_DISABLED=1 \
     -DPICO_NO_TIMING_DEMO=1 \
-    -DZ_MALOOC_EXTRA_DATA=1
+    -DZ_MALOOC_EXTRA_DATA=1 \
+    -DUSE_EMU8950_OPL=1 \
+    -DEMU8950_NO_WAVE_TABLE_MAP=1 \
+    -DEMU8950_NO_TLL=1 \
+    -DEMU8950_NO_FLOAT=1 \
+    -DEMU8950_NO_TIMER=1 \
+    -DEMU8950_NO_TEST_FLAG=1 \
+    -DEMU8950_NO_PERCUSSION_MODE=1 \
+    -DEMU8950_NO_RATECONV=1 \
+    -DEMU8950_SIMPLER_NOISE=1 \
+    -DEMU8950_SHORT_NOISE_UPDATE_CHECK=1 \
+    -DEMU8950_LINEAR=1 \
+    -DEMU8950_LINEAR_SKIP=1 \
+    -DEMU8950_LINEAR_END_OF_NOTE_OPTIMIZATION=1
 
 CFLAGS  := $(CPU) $(DEFINES) $(DOOM_DEFINES) $(INCLUDES) \
            -include src/doom_glue/net_client.h \
@@ -305,11 +318,13 @@ $(HOT_OBJS): $(BUILD_DIR)/%.o: %.c
 
 # OPL music synth is per-sample work at the native 49716 Hz rate; needs
 # the most aggressive optimization the toolchain can offer. -O3 lets
-# GCC unroll the slot loops and emit Cortex-M33 DSP/SIMD instructions
-# (SMUL/SMLA/SSAT16) where the int multiplies in SlotGenerate appear.
-# Setting it here (not via #pragma) survives LTO consistently.
-OPL_CFLAGS := $(filter-out -Os,$(CFLAGS)) -O3
-OPL_OBJS := $(BUILD_DIR)/doom/opl/opl3.o
+# GCC unroll the per-channel loops and emit Cortex-M33 DSP/SIMD
+# instructions where int multiplies appear. Setting it here (not via
+# #pragma) survives LTO consistently. emu8950's LINEAR mode runs
+# channel-batched and skips silent slots, lighter than opl3.c per
+# native sample even before -O3.
+OPL_CFLAGS := $(filter-out -Os,$(CFLAGS)) -O3 -fplan9-extensions
+OPL_OBJS := $(BUILD_DIR)/doom/opl/emu8950.o
 
 $(OPL_OBJS): $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)

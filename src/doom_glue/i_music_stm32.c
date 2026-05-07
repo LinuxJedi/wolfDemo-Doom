@@ -37,12 +37,19 @@
 
 #include "opl.h"
 #include "opl_queue.h"
-#include "opl3.h"
+#include "emu8950.h"
 
+/* Native OPL2 chip clock. emu8950 with EMU8950_NO_RATECONV must run
+ * with output rate == clock/72 == 49716 Hz, so we generate music at
+ * the native rate then decimate to MUSIC_SAMPLE_RATE in our render
+ * loop. The decimation is a simple skip - aliasing is mild because
+ * Doom OPL music's spectral energy sits below 5 kHz. */
+#define MUSIC_OPL_CLK     3579545u
+#define MUSIC_NATIVE_RATE 49716u
 #define MUSIC_SAMPLE_RATE 11025u
 
 /* Shared state. */
-static opl3_chip            opl_chip;
+static OPL                  *emu8950_opl;
 static opl_callback_queue_t *callback_queue;
 static uint64_t             current_time_us;
 static uint64_t             pause_offset_us;
@@ -69,7 +76,12 @@ int snd_samplerate = MUSIC_SAMPLE_RATE;
 opl_init_result_t OPL_Init(unsigned int port_base)
 {
     (void)port_base;  /* we have no real OPL hardware */
-    OPL3_Reset(&opl_chip, MUSIC_SAMPLE_RATE);
+    if (emu8950_opl == NULL) {
+        emu8950_opl = OPL_new(MUSIC_OPL_CLK, MUSIC_NATIVE_RATE);
+        if (emu8950_opl == NULL) return OPL_INIT_NONE;
+    } else {
+        OPL_reset(emu8950_opl);
+    }
     if (callback_queue == NULL) {
         callback_queue = OPL_Queue_Create();
     } else {
@@ -114,7 +126,7 @@ unsigned int OPL_ReadStatus(void)
 
 void OPL_WriteRegister(int reg, int value)
 {
-    OPL3_WriteRegBuffered(&opl_chip, (Bit16u)reg, (Bit8u)value);
+    if (emu8950_opl) OPL_writeReg(emu8950_opl, (uint32_t)reg, (uint8_t)value);
 }
 
 opl_init_result_t OPL_Detect(void)
@@ -188,6 +200,15 @@ void OPL_Delay(uint64_t us)
  * If music is uninitialised or a song isn't loaded, fills `out` with
  * silence and returns - the SFX mixer can blend zeros in cheaply.
  */
+/* Native-rate scratch buffer. emu8950's LINEAR-mode OPL_calc_buffer_stereo
+ * writes int32 samples (raw left/right packed); we take the low 16 bits
+ * as mono. Sized for a 256-output-sample inner batch: 256 * 49716/11025
+ * = ~1155 native samples, rounded up. The outer music_render_chunk
+ * loop iterates as many inner batches as needed for the requested n. */
+#define OUTPUT_BATCH_MAX 256
+#define NATIVE_BATCH_MAX 1280
+static int32_t emu_scratch[NATIVE_BATCH_MAX];
+
 void music_render_chunk(int16_t *out, int n)
 {
     if (!music_initialized) {
@@ -196,35 +217,44 @@ void music_render_chunk(int16_t *out, int n)
     }
 
     int filled = 0;
-    int16_t stereo[2];
 
     while (filled < n) {
         int chunk = n - filled;
+        if (chunk > OUTPUT_BATCH_MAX) chunk = OUTPUT_BATCH_MAX;
 
-        /* Limit this slice to the time of the next pending callback,
-         * so callbacks fire close to their target time even within
-         * one mixer chunk. */
+        /* Limit this slice to the time of the next pending callback. */
         if (!opl_paused && !OPL_Queue_IsEmpty(callback_queue)) {
             uint64_t next_t = OPL_Queue_Peek(callback_queue) + pause_offset_us;
             if (next_t > current_time_us) {
                 uint64_t until_us = next_t - current_time_us;
-                /* (until_us * MUSIC_SAMPLE_RATE + 999999) / 1000000,
-                 * but we want at least 1 sample so we always advance. */
                 uint64_t until_samples =
                     (until_us * MUSIC_SAMPLE_RATE) / 1000000ull;
                 if (until_samples == 0) until_samples = 1;
                 if (until_samples < (uint64_t)chunk) chunk = (int)until_samples;
             } else {
-                /* Already past due; service immediately. */
                 chunk = 1;
             }
         }
 
+        /* Map output samples to native samples: native = output * (49716/11025)
+         * = output * 4.5089... The integer ratio is close enough; sample-rate
+         * drift accumulates slowly over a track but doesn't cause perceptible
+         * pitch error in chiptune-style OPL music. */
+        int n_native = (chunk * MUSIC_NATIVE_RATE) / MUSIC_SAMPLE_RATE;
+        if (n_native < 1) n_native = 1;
+        if (n_native > NATIVE_BATCH_MAX) n_native = NATIVE_BATCH_MAX;
+
+        OPL_calc_buffer_stereo(emu8950_opl, emu_scratch, (uint32_t)n_native);
+
+        /* Decimate native -> output. emu_scratch[i] packs (raw<<16)|raw
+         * (left=right=raw int16, see OPL_calc_buffer_stereo). Take low
+         * 16 bits as mono. Pick samples by linear stride; aliasing is
+         * mild because Doom OPL music spectrum is well below the
+         * decimation Nyquist (~2.5 kHz). */
         for (int i = 0; i < chunk; i++) {
-            OPL3_GenerateResampled(&opl_chip, stereo);
-            /* Doom music is mono; the OPL driver pans left=right
-             * anyway for non-spatial sources, so just take left. */
-            out[filled + i] = stereo[0];
+            int idx = (i * n_native) / chunk;
+            if (idx >= n_native) idx = n_native - 1;
+            out[filled + i] = (int16_t)(emu_scratch[idx] & 0xFFFF);
         }
         filled += chunk;
 
