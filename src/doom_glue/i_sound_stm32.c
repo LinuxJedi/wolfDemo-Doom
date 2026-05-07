@@ -102,7 +102,13 @@
 #include "doom/sounds.h"
 
 #define AUDIO_SAMPLE_RATE   11025u
-#define HALF_SAMPLES        512
+/* HALF_SAMPLES = 1024 means each chunk covers ~93 ms of audio.
+ * Larger chunks absorb music-synth runtime jitter (a busy chunk that
+ * takes 60 ms to render still finishes before the buddy chunk runs
+ * out). The trade-off is +93 ms of SFX latency, which is on the edge
+ * of perceptible but acceptable for a Doom shareware demo where
+ * gunshot timing isn't competitive. */
+#define HALF_SAMPLES        1024
 #define RING_SAMPLES        (HALF_SAMPLES * 2)
 
 #define ADPCM_BLOCK_SIZE              128
@@ -273,17 +279,17 @@ static void mix_chunk(uint16_t *out, int n)
 
     music_render_chunk(music_buf, n);
 
-    /* OPL output is int16 (-32768..32767). The SFX accumulator
-     * (mix_buf) holds sample*vol per channel, single-channel peak
-     * ~+-16K, 8-channel peak ~+-128K. Then MIX_OUTPUT_SHIFT (6) maps
-     * to +-2047 12-bit range. We seed mix_buf with music scaled down
-     * to ~+-8K (>> 2): post-shift that's +-128, sitting comfortably
-     * at line level - lower than peak SFX, matching the engine's
-     * "music as background, SFX as foreground" mix. Adjust MUSIC_SHIFT
-     * if the balance feels off in practice. */
-    #define MUSIC_SHIFT 2
+    /* OPL output is int16 (-32768..32767). Pass it through unshifted
+     * so music sits at ~25% of the post-MIX_OUTPUT_SHIFT DAC range
+     * (32K >> 6 = 500 of 2047), audible at line level. SFX still
+     * dominates when it peaks (8-channel SFX ~+-128K -> >>6 ~+-2K =
+     * full scale). The clamp at the bottom of this function catches
+     * the rare music+SFX-both-peaking case (max ~160K post-shift =
+     * ~2.5K), which clips by 25% - acceptable since simultaneous
+     * peaks are brief and clipping music tail under SFX is the
+     * vanilla mix balance anyway. */
     for (int s = 0; s < n; s++)
-        mix_buf[s] = (int32_t)music_buf[s] >> MUSIC_SHIFT;
+        mix_buf[s] = (int32_t)music_buf[s];
 
     for (int ci = 0; ci < NUM_SOUND_CHANNELS; ci++) {
         channel_t *ch = &channels[ci];
