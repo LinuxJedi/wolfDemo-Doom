@@ -59,6 +59,7 @@
 #include "doom/m_menu.h"
 #include "doom/m_random.h"
 #include "doom/st_stuff.h"
+#include "doom/wi_stuff.h"
 #include "picodoom.h"
 
 extern uint8_t *I_VideoBuffer;
@@ -1455,6 +1456,20 @@ void pd_end_frame(int wipe_start)
             }
         }
 
+        /* Intermission summary. WI_Start (called from G_DoCompleted)
+         * loads wi_background_patch_num (WIMAP1/2/3 or INTERPIC); we
+         * decode it into the framebuffer here, then re-arm the patchlist
+         * and let WI_Drawer emit the level name, "Finished!", and stat
+         * widgets via V_DrawPatch. The existing V_DrawPatchList drain
+         * below renders them on top of the background. The upstream
+         * D_Display switch that calls WI_Drawer is compiled out under
+         * PD_COLUMNS=1, so this dispatch is the only path. */
+        if (gamestate == GS_INTERMISSION && wi_background_patch_num) {
+            splash_draw(wi_background_patch_num, 0, DOOM_H, I_VideoBuffer);
+            V_BeginPatchList(vpatchlists->framebuffer);
+            WI_Drawer();
+        }
+
         /* Drain sprites here, after R_RenderPlayerView has emitted all
          * walls + visplanes + masked columns into our queues. Enemies
          * sit on top of the world geometry; the player weapon sprite
@@ -1561,8 +1576,9 @@ void pd_end_frame(int wipe_start)
     }
 
     /* Always blit. For GS_LEVEL the silhouette renderer has already
-     * painted into I_VideoBuffer via the pd_add_* callbacks. For
-     * GS_FINALE / GS_INTERMISSION we'll ship whatever's in the
-     * buffer (likely the previous frame) until those paths are wired. */
+     * painted into I_VideoBuffer via the pd_add_* callbacks; for
+     * GS_INTERMISSION the WIMAP background plus WI_Drawer's patchlist
+     * widgets land here via the block above. GS_FINALE still ships
+     * whatever's in the buffer until F_Drawer is wired. */
     I_FinishUpdate();
 }
