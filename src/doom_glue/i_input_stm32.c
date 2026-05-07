@@ -29,11 +29,16 @@
 
 #include "stm32u585xx.h"
 #include "../board.h"
+#include "../qwstpad.h"
+
+#include "d_event.h"
+#include "doomkeys.h"
 
 extern bool show_fps;
 
-static uint8_t btn_prev_state;  /* bit0 = BTN1 pressed last sample,
-                                 * bit1 = BTN2 pressed last sample */
+static uint8_t  btn_prev_state;  /* bit0 = BTN1 pressed last sample,
+                                  * bit1 = BTN2 pressed last sample */
+static uint16_t pad_prev_state;  /* QwSTPad button bitmap last sample */
 
 static void btn_init(void)
 {
@@ -60,6 +65,69 @@ static void btn_init(void)
     BTN_PORT->PUPDR = pupdr;
 }
 
+/*
+ * QwSTPad bit -> Doom keycode. Mapping mirrors Heretic-era defaults
+ * in m_controls.c so the engine sees keys it already binds to game
+ * actions (fire = RCTRL, use = SPACE, strafe = RALT, run = RSHIFT,
+ * arrows = move/turn). + and - drive ENTER/ESC for menu navigation.
+ *
+ * Index = QwSTPad pin number (0x0..0xF). Slots that don't correspond
+ * to a button are 0 and the polling loop skips them.
+ */
+static const uint8_t pad_keymap[16] = {
+    [QWSTPAD_BTN_U]     = KEY_UPARROW,
+    [QWSTPAD_BTN_D]     = KEY_DOWNARROW,
+    [QWSTPAD_BTN_L]     = KEY_LEFTARROW,
+    [QWSTPAD_BTN_R]     = KEY_RIGHTARROW,
+    [QWSTPAD_BTN_A]     = KEY_RCTRL,
+    [QWSTPAD_BTN_B]     = ' ',
+    [QWSTPAD_BTN_X]     = KEY_RALT,
+    [QWSTPAD_BTN_Y]     = KEY_RSHIFT,
+    [QWSTPAD_BTN_PLUS]  = KEY_ENTER,
+    [QWSTPAD_BTN_MINUS] = KEY_ESCAPE,
+};
+
+static void pad_init(void)
+{
+    static int initialized;
+    if (initialized) return;
+    /* Try once. If the pad is unplugged, qwstpad_init() returns -1;
+     * leave `initialized` clear so the next button_tick() retries
+     * (lets a hot-plug eventually take effect). */
+    if (qwstpad_init() == 0) initialized = 1;
+}
+
+static void pad_tick(void)
+{
+    pad_init();
+
+    uint16_t cur = qwstpad_read_buttons();
+    uint16_t changed = cur ^ pad_prev_state;
+    if (changed == 0) return;
+
+    /* Walk the bits that flipped. For each, post a keydown if newly
+     * pressed or keyup if newly released. Doom's MAXEVENTS queue is
+     * only 8 entries deep in DOOM_SMALL mode, but realistic input
+     * generates at most a handful of edges per frame. */
+    while (changed != 0) {
+        uint32_t bit = (uint32_t)__builtin_ctz(changed);
+        changed &= changed - 1u;
+        uint8_t key = pad_keymap[bit];
+        if (key == 0) continue;
+
+        event_t ev;
+        ev.type  = (cur & (1u << bit)) ? ev_keydown : ev_keyup;
+        ev.data1 = key;
+        ev.data2 = 0;
+        ev.data3 = 0;
+        ev.data4 = 0;
+        ev.data5 = 0;
+        D_PostEvent(&ev);
+    }
+
+    pad_prev_state = cur;
+}
+
 void button_tick(void)
 {
     btn_init();
@@ -72,9 +140,11 @@ void button_tick(void)
         show_fps = !show_fps;
     }
     btn_prev_state = cur;
+
+    pad_tick();
 }
 
-void I_InitInput(void)         { btn_init(); }
+void I_InitInput(void)         { btn_init(); pad_init(); }
 void I_ShutdownInput(void)     { }
 void I_StartTextInput(int x1, int y1, int x2, int y2) {
     (void)x1; (void)y1; (void)x2; (void)y2;

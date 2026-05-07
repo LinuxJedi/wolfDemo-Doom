@@ -60,6 +60,15 @@
 #define BTN1_PIN                4   /* PB4 - SW2 / BT1 */
 #define BTN2_PIN                5   /* PB5 - SW4 / BT2 */
 
+/* ---- I2C1 on mikroBus 2 (Qwiic / STEMMA-QT bus) ---- */
+#define I2C_PINS_PORT           GPIOB
+#define I2C_SCL_PIN             6   /* PB6 I2C1_SCL */
+#define I2C_SDA_PIN             9   /* PB9 I2C1_SDA */
+#define I2C_AF                  4   /* AF4 = I2C1 */
+
+/* Pimoroni QwSTPad (TCA9555 I/O expander). 7-bit I2C address. */
+#define QWSTPAD_I2C_ADDR        0x21u
+
 /* ---- System clock target after PLL ----
  * 160 MHz at VOS Range 1 with EPOD booster, matching the wolfDemo
  * blinky example. PLL: HSE 8 MHz / M=1 * N=20 / R=1 = 160 MHz. */

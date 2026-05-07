@@ -21,6 +21,8 @@ C_SRCS := \
     src/clock.c \
     src/uart.c \
     src/spi.c \
+    src/i2c.c \
+    src/qwstpad.c \
     src/st7789.c \
     src/syscalls.c \
     src/system_stm32u5xx.c \
