@@ -60,6 +60,7 @@
 #include "doom/m_random.h"
 #include "doom/st_stuff.h"
 #include "doom/wi_stuff.h"
+#include "doom/f_finale.h"
 #include "picodoom.h"
 
 extern uint8_t *I_VideoBuffer;
@@ -687,6 +688,20 @@ static uint8_t  psprite_queue_segs[PSPRITE_QUEUE_SEG_BYTES];
 static uint16_t psprite_queue_count;
 static uint16_t psprite_queue_segs_used;
 
+/* Fuzz pattern: vanilla r_draw.c:309-318. Each entry is +DOOM_W or
+ * -DOOM_W (one row down/up); we store the sign and apply * DOOM_W at
+ * sample time. fuzzpos advances per pixel and wraps at 50, deliberately
+ * persisting across columns / sprites / frames so the shimmer pattern
+ * shifts continuously. */
+static const int8_t fuzz_dy[50] = {
+    +1, -1, +1, -1, +1, +1, -1, +1, +1, -1,
+    +1, +1, +1, -1, +1, +1, +1, -1, -1, -1,
+    -1, +1, -1, -1, +1, +1, +1, +1, -1, +1,
+    +1, -1, -1, +1, +1, -1, -1, -1, -1, +1,
+    +1, +1, +1, +1, -1, +1, -1, +1, +1, -1,
+};
+static int fuzzpos;
+
 void pd_add_masked_columns(uint8_t *ys, int seg_count)
 {
     int real_id = dc_source.real_id;
@@ -777,6 +792,35 @@ void pd_add_masked_columns(uint8_t *ys, int seg_count)
 static void render_queued_column(const sprite_queued_column_t *q,
                                  const uint8_t *seg_buf)
 {
+    /* Fuzz path: MF_SHADOW mobjs (Spectres, Partial-Invisibility-affected
+     * actors) arrive with colormap_index < 0. Vanilla R_DrawFuzzColumn
+     * (r_draw.c:305-383) ignores the patch entirely and resamples a
+     * neighbour framebuffer pixel through colormap 6 (the shadow tint),
+     * walking fuzz_dy[] to pick +/- 1 row per pixel. drain_sprite_queues
+     * runs after walls/floors are painted, so I_VideoBuffer holds the
+     * already-rendered scenery underneath. */
+    if (q->colormap_index < 0) {
+        const uint8_t *cmap = colormaps + 6 * 256;
+        int x = q->x;
+        if ((unsigned)x >= (unsigned)DOOM_W) return;
+        const uint8_t *ys = &seg_buf[q->seg_offset];
+        for (int s = 0; s < q->seg_count; s++) {
+            int yl = ys[s * 3];
+            int yh = ys[s * 3 + 1];
+            if (yh > DOOM_H - 1) yh = DOOM_H - 1;
+            for (int y = yl; y <= yh; y++) {
+                int sy = y + fuzz_dy[fuzzpos];
+                fuzzpos++;
+                if (fuzzpos >= 50) fuzzpos = 0;
+                if (sy < 0) sy = 0;
+                else if (sy > DOOM_H - 1) sy = DOOM_H - 1;
+                I_VideoBuffer[y * DOOM_W + x] =
+                    cmap[I_VideoBuffer[sy * DOOM_W + x]];
+            }
+        }
+        return;
+    }
+
     int patch_num = -q->real_id;
     load_patch_decoder(patch_num);
     if (cached_width <= 0) return;
@@ -838,12 +882,9 @@ static void render_queued_column(const sprite_queued_column_t *q,
     }
 
     fixed_t fracstep = q->iscale;
-    /* Fuzz (negative colormap index for partial-invisibility)
-     * isn't rendered specially; fall back to fullbright so the
-     * sprite is at least visible. */
-    int cmi = q->colormap_index;
-    if (cmi < 0) cmi = 0;
-    const lighttable_t *cmap = colormaps + 256 * cmi;
+    /* Fuzz (colormap_index < 0) is handled via the early return at the
+     * top of this function; here colormap_index is guaranteed >= 0. */
+    const lighttable_t *cmap = colormaps + 256 * q->colormap_index;
     int x = q->x;
     const uint8_t *ys = &seg_buf[q->seg_offset];
 
@@ -1470,6 +1511,41 @@ void pd_end_frame(int wipe_start)
             WI_Drawer();
         }
 
+        /* End-of-episode finale screen. Under DOOM_TINY F_TextWrite
+         * doesn't redraw the tiled flat each frame - it only
+         * V_DrawPatches the last few characters and assumes the
+         * framebuffer already has the background. Paint the flat once
+         * on transition into GS_FINALE; subsequent frames let the
+         * patchlist drain accumulate text on top. F_ArtScreenDrawer
+         * issues a fullscreen V_DrawPatch for HELP2 (E1 shareware),
+         * which overwrites the text when F_Ticker advances stages -
+         * no special handling needed for that transition. */
+        {
+            static gamestate_t finale_prev = (gamestate_t)-1;
+            if (gamestate == GS_FINALE) {
+                if (finale_prev != GS_FINALE && finaleflat) {
+                    int flat_lump = W_CheckNumForName(finaleflat);
+                    if (flat_lump >= 0) {
+                        int picnum = flat_lump - firstflat;
+                        if (picnum >= 0) {
+                            const uint8_t *src = load_flat(picnum);
+                            for (int y = 0; y < DOOM_H; y++) {
+                                uint8_t *dst = I_VideoBuffer + y * DOOM_W;
+                                const uint8_t *row = src + ((y & 63) << 6);
+                                for (int x = 0; x < DOOM_W; x += 64) {
+                                    int cw = (DOOM_W - x) < 64 ? (DOOM_W - x) : 64;
+                                    memcpy(dst + x, row, cw);
+                                }
+                            }
+                        }
+                    }
+                }
+                V_BeginPatchList(vpatchlists->framebuffer);
+                F_Drawer();
+            }
+            finale_prev = gamestate;
+        }
+
         /* Drain sprites here, after R_RenderPlayerView has emitted all
          * walls + visplanes + masked columns into our queues. Enemies
          * sit on top of the world geometry; the player weapon sprite
@@ -1578,7 +1654,8 @@ void pd_end_frame(int wipe_start)
     /* Always blit. For GS_LEVEL the silhouette renderer has already
      * painted into I_VideoBuffer via the pd_add_* callbacks; for
      * GS_INTERMISSION the WIMAP background plus WI_Drawer's patchlist
-     * widgets land here via the block above. GS_FINALE still ships
-     * whatever's in the buffer until F_Drawer is wired. */
+     * widgets land here via the block above; for GS_FINALE the tiled
+     * finaleflat (painted on entry) plus F_Drawer's accumulated text
+     * patches land via the block above. */
     I_FinishUpdate();
 }
