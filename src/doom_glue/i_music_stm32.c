@@ -249,16 +249,13 @@ void music_render_chunk(int16_t *out, int n)
 
 extern const music_module_t music_opl_module;
 
-/* Runtime music enable. The OPL2 synth + MIDI sequencer averages
- * ~50%+ CPU at 160 MHz once you account for the 4.5x decimation from
- * 49716 Hz native to 11025 Hz output, with 18 slot-generates per
- * native sample. Even with the music synth deferred to PendSV at
- * lowest priority, that leaves the main render loop too little
- * headroom to produce frames at a watchable rate. Default music OFF
- * until the synth is optimised (DSP intrinsics, lower internal rate,
- * or per-channel skip-when-silent). The OPL code stays linked so
- * the toggle is a one-bool flip. */
-static int music_enabled = 0;
+/* Runtime music enable. With opl3.c built at -O3 and the OPL2-mode
+ * short-circuit skipping the 18 unused OPL3-only slots per sample,
+ * the synth fits within the available CPU headroom alongside the
+ * renderer. Music synth still runs in PendSV at the lowest priority
+ * so it can be preempted by SPI-TC, SysTick, and per-sample TIM6
+ * firings. */
+static int music_enabled = 1;
 
 void I_EnableMusic(int enable)
 {

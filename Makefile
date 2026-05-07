@@ -303,6 +303,18 @@ $(HOT_OBJS): $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(HOT_CFLAGS) -c $< -o $@
 
+# OPL music synth is per-sample work at the native 49716 Hz rate; needs
+# the most aggressive optimization the toolchain can offer. -O3 lets
+# GCC unroll the slot loops and emit Cortex-M33 DSP/SIMD instructions
+# (SMUL/SMLA/SSAT16) where the int multiplies in SlotGenerate appear.
+# Setting it here (not via #pragma) survives LTO consistently.
+OPL_CFLAGS := $(filter-out -Os,$(CFLAGS)) -O3
+OPL_OBJS := $(BUILD_DIR)/doom/opl/opl3.o
+
+$(OPL_OBJS): $(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(OPL_CFLAGS) -c $< -o $@
+
 # Wrap the WAD blob into an ELF object whose data lives in section .wad.
 # The objcopy --rename-section moves the default .data into our linker's
 # .wad output section. Symbols _binary_*_start/_end are defined automatically.

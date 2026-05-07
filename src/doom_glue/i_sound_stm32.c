@@ -397,18 +397,25 @@ static void audio_hw_init(void)
     TIM6->DIER  = TIM_DIER_UIE;        /* update interrupt enable */
 
     NVIC_ClearPendingIRQ(TIM6_IRQn);
-    /* TIM6 fires per-sample at 11025 Hz; the per-sample handler must
-     * be lean (DAC write + pointer advance) so we keep it at the
-     * default high priority. The chunk refill (which now includes
-     * OPL music synthesis at ~10 ms/chunk) is deferred to PendSV at
-     * the lowest priority so SPI-TC, SysTick, and follow-up TIM6
-     * sample firings can all preempt it. Without this split, music
-     * synth blocked the GPDMA1 TC interrupt that drives the ST7789
-     * blit, collapsing the visible frame rate. */
-    NVIC_SetPriority(TIM6_IRQn, 0);
-    /* PendSV is the canonical "deferred work" Cortex-M handler.
-     * Lowest priority = numerically highest. */
-    NVIC_SetPriority(PendSV_IRQn, 0xFF);
+    /* Priority hierarchy (lower number = higher priority, 4 prio bits):
+     *   - GPDMA1 TC, TIM6 sample IRQ: priority 1 (must not be missed)
+     *   - SysTick: priority 2 (engine clock advance during music synth)
+     *   - PendSV: priority 15 (lowest - music synth runs here)
+     *
+     * The deferred-PendSV split keeps music synth (~25 ms per 46 ms
+     * chunk after -O3 + OPL2 short-circuit) from blocking the per-
+     * sample TIM6 firings or the SPI blit's GPDMA1 TC. SysTick at
+     * priority 2 preempts PendSV so millis() keeps advancing during
+     * the music synth window - without that, gametic freezes and the
+     * engine appears to halt right after the title music plays.
+     *
+     * Direct SHPR writes (rather than NVIC_SetPriority) so we don't
+     * depend on the CMSIS macro masking under TrustZone secure state
+     * on STM32U5. Pre-shifted by 4 since we have 4 priority bits.
+     * SHPR3 byte 2 = PendSV, byte 3 = SysTick. */
+    SCB->SHPR[10] = (uint8_t)(0xF << 4);  /* PendSV at lowest */
+    SCB->SHPR[11] = (uint8_t)(0x2 << 4);  /* SysTick at priority 2 */
+    NVIC_SetPriority(TIM6_IRQn, 1);
     NVIC_EnableIRQ(TIM6_IRQn);
 
     __asm volatile ("dsb" ::: "memory");
