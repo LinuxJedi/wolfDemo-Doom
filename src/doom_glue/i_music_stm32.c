@@ -39,6 +39,11 @@
 #include "opl_queue.h"
 #include "emu8950.h"
 
+/* Mono-int32 batch generator. Not in emu8950.h's public surface but
+ * implemented at file scope in emu8950.c (line 1727). Skips the
+ * duplicate-then-strip pass that OPL_calc_buffer_stereo does for us. */
+extern void OPL_calc_buffer_linear(OPL *opl, int32_t *buffer, uint32_t nsamples);
+
 /* Native OPL2 chip clock. emu8950 with EMU8950_NO_RATECONV must run
  * with output rate == clock/72 == 49716 Hz, so we generate music at
  * the native rate then decimate to MUSIC_SAMPLE_RATE in our render
@@ -202,11 +207,13 @@ void OPL_Delay(uint64_t us)
  */
 /* Native-rate scratch buffer. emu8950's LINEAR-mode OPL_calc_buffer_stereo
  * writes int32 samples (raw left/right packed); we take the low 16 bits
- * as mono. Sized for a 256-output-sample inner batch: 256 * 49716/11025
- * = ~1155 native samples, rounded up. The outer music_render_chunk
- * loop iterates as many inner batches as needed for the requested n. */
-#define OUTPUT_BATCH_MAX 256
-#define NATIVE_BATCH_MAX 1280
+ * as mono. emu8950's internal lfo_am_buffer is fixed at SAMPLE_BUF_SIZE
+ * (1024) native samples per call, so OUTPUT_BATCH_MAX is capped at
+ * 224 output samples (224 * 49716/11025 = 1010 native, safely under
+ * the limit). The outer music_render_chunk loop iterates as many inner
+ * batches as needed for the requested n. */
+#define OUTPUT_BATCH_MAX 224
+#define NATIVE_BATCH_MAX 1024
 static int32_t emu_scratch[NATIVE_BATCH_MAX];
 
 void music_render_chunk(int16_t *out, int n)
@@ -244,17 +251,21 @@ void music_render_chunk(int16_t *out, int n)
         if (n_native < 1) n_native = 1;
         if (n_native > NATIVE_BATCH_MAX) n_native = NATIVE_BATCH_MAX;
 
-        OPL_calc_buffer_stereo(emu8950_opl, emu_scratch, (uint32_t)n_native);
+        OPL_calc_buffer_linear(emu8950_opl, emu_scratch, (uint32_t)n_native);
 
-        /* Decimate native -> output. emu_scratch[i] packs (raw<<16)|raw
-         * (left=right=raw int16, see OPL_calc_buffer_stereo). Take low
-         * 16 bits as mono. Pick samples by linear stride; aliasing is
-         * mild because Doom OPL music spectrum is well below the
-         * decimation Nyquist (~2.5 kHz). */
+        /* Decimate native -> output via Bresenham-style accumulator
+         * (n_native steps of n_native into chunk steps of chunk).
+         * Avoids a per-sample integer divide; aliasing is mild because
+         * Doom OPL music spectrum sits well below the decimation
+         * Nyquist (~5.5 kHz). */
+        int idx = 0, err = 0;
         for (int i = 0; i < chunk; i++) {
-            int idx = (i * n_native) / chunk;
-            if (idx >= n_native) idx = n_native - 1;
             out[filled + i] = (int16_t)(emu_scratch[idx] & 0xFFFF);
+            err += n_native;
+            while (err >= chunk) {
+                err -= chunk;
+                idx++;
+            }
         }
         filled += chunk;
 
