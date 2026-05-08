@@ -44,13 +44,18 @@
  * duplicate-then-strip pass that OPL_calc_buffer_stereo does for us. */
 extern void OPL_calc_buffer_linear(OPL *opl, int32_t *buffer, uint32_t nsamples);
 
-/* Native OPL2 chip clock. emu8950 with EMU8950_NO_RATECONV must run
- * with output rate == clock/72 == 49716 Hz, so we generate music at
- * the native rate then decimate to MUSIC_SAMPLE_RATE in our render
- * loop. The decimation is a simple skip - aliasing is mild because
- * Doom OPL music's spectral energy sits below 5 kHz. */
-#define MUSIC_OPL_CLK     3579545u
-#define MUSIC_NATIVE_RATE 49716u
+/* OPL2 chip clock. emu8950 with EMU8950_NO_RATECONV renders at
+ * clock/72 Hz internally and that's also our buffer-linear emit rate.
+ * The native Adlib clock is 3.58 MHz (clock/72 = 49716 Hz). We halve
+ * it here to cut OPL synthesis cost ~50%; pitch is restored by
+ * shifting BLOCK up by 1 on every 0xB0-0xB8 register write (each
+ * block step doubles frequency, exactly cancelling the clock/2).
+ * Aliasing on the post-decimate 11025 Hz output stays mild because
+ * Doom OPL music's spectral energy sits below 5 kHz. Side effects:
+ * envelope and LFO rates also halve, so attacks/decays are softer
+ * and tremolo/vibrato run slower. The musical content is preserved. */
+#define MUSIC_OPL_CLK     1789773u    /* native 3579545 / 2 */
+#define MUSIC_NATIVE_RATE 24858u      /* MUSIC_OPL_CLK / 72 */
 #define MUSIC_SAMPLE_RATE 11025u
 
 /* Shared state. */
@@ -132,6 +137,18 @@ unsigned int OPL_ReadStatus(void)
 
 void OPL_WriteRegister(int reg, int value)
 {
+    /* Block-up compensation for the halved chip clock (see
+     * MUSIC_OPL_CLK comment). Registers 0xB0-0xB8 carry KEY-ON (bit 5),
+     * BLOCK (bits 4..2), and F-Number high (bits 1..0). Bumping BLOCK
+     * by +1 doubles the audible frequency, restoring the pitch the
+     * music was composed for. BLOCK == 7 can't go higher; those notes
+     * (rare in Doom MIDI - mostly very high leads) play one octave
+     * lower than intended. */
+    if (reg >= 0xB0 && reg <= 0xB8) {
+        int block = (value & 0x1c) >> 2;
+        if (block < 7) block++;
+        value = (value & ~0x1c) | (block << 2);
+    }
     if (emu8950_opl) OPL_writeReg(emu8950_opl, (uint32_t)reg, (uint8_t)value);
 }
 
@@ -210,9 +227,10 @@ void OPL_Delay(uint64_t us)
  * writes int32 samples (raw left/right packed); we take the low 16 bits
  * as mono. emu8950's internal lfo_am_buffer is fixed at SAMPLE_BUF_SIZE
  * (1024) native samples per call, so OUTPUT_BATCH_MAX is capped at
- * 224 output samples (224 * 49716/11025 = 1010 native, safely under
- * the limit). The outer music_render_chunk loop iterates as many inner
- * batches as needed for the requested n. */
+ * 224 output samples (224 * 24858/11025 = 505 native, safely under
+ * the limit; was 1010 before MUSIC_NATIVE_RATE was halved). The outer
+ * music_render_chunk loop iterates as many inner batches as needed for
+ * the requested n. */
 #define OUTPUT_BATCH_MAX 224
 #define NATIVE_BATCH_MAX 1024
 static int32_t emu_scratch[NATIVE_BATCH_MAX];
@@ -253,10 +271,11 @@ void music_render_chunk(int16_t *out, int n)
             memset(out + filled, 0, chunk * sizeof(int16_t));
         } else {
             /* Map output samples to native samples: native = output *
-             * (49716/11025) = output * 4.5089... The integer ratio is
-             * close enough; sample-rate drift accumulates slowly over
-             * a track but doesn't cause perceptible pitch error in
-             * chiptune-style OPL music. */
+             * (24858/11025) = output * 2.255 (post-rate-halve; full
+             * Adlib was 4.5089). The integer ratio is close enough;
+             * sample-rate drift accumulates slowly over a track but
+             * doesn't cause perceptible pitch error in chiptune-style
+             * OPL music. */
             int n_native = (chunk * MUSIC_NATIVE_RATE) / MUSIC_SAMPLE_RATE;
             if (n_native < 1) n_native = 1;
             if (n_native > NATIVE_BATCH_MAX) n_native = NATIVE_BATCH_MAX;
