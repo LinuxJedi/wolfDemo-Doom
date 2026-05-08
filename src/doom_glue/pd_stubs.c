@@ -63,15 +63,25 @@
 #include "doom/f_finale.h"
 #include "picodoom.h"
 
-extern uint8_t *I_VideoBuffer;
+#include "i_video_lut.h"
+
+extern pixel_t *I_VideoBuffer;
 extern void I_FinishUpdate(void);
 extern void I_SetPalette(const uint8_t *palette);
 extern int  I_GetTimeMS(void);
 extern const char *pagename;
 extern void button_tick(void);
 
-#define DOOM_W      320
+#define DOOM_W      320          /* logical render width (engine geometry) */
 #define DOOM_H      200
+#define DISP_W      240          /* physical scan-out width (RGB565 buffer) */
+
+/* Compact x from 320-space to 240-space by dropping every 4th column.
+ * Equivalent to (x * 3) / 4 but avoids the multiply. The (x & 3) == 3
+ * columns are filtered out at the head of pd_add_*; for the kept
+ * columns this maps 0->0, 1->1, 2->2, 4->3, 5->4, 6->5, 8->6, ...
+ * which lays them out contiguously in the 240-wide RGB565 buffer. */
+static inline int x_squeeze(int x) { return x - (x >> 2); }
 
 /* pd_render.cpp owns these; types must match the upstream externs. */
 int              pd_flag;
@@ -103,10 +113,11 @@ static inline void paint_column(int x, int yl, int yh, uint8_t colour)
     if (yl < 0) yl = 0;
     if (yh > DOOM_H - 1) yh = DOOM_H - 1;
     if (yl > yh || x < 0 || x >= DOOM_W) return;
-    uint8_t *dest = &I_VideoBuffer[yl * DOOM_W + x];
+    uint16_t pix = palette_rgb565[colour];
+    pixel_t *dest = &I_VideoBuffer[yl * DISP_W + x_squeeze(x)];
     for (int y = yl; y <= yh; y++) {
-        *dest = colour;
-        dest += DOOM_W;
+        *dest = pix;
+        dest += DISP_W;
     }
 }
 
@@ -457,12 +468,12 @@ static void paint_composite_column(void)
     fixed_t frac = dc_texturemid + (yl - centery) * fracstep;
     int cmi = dc_colormap_index;
     if (cmi < 0) cmi = 0;
-    const lighttable_t *cmap = colormaps + 256 * cmi;
+    const uint16_t *clut = lit_lut[cmi];
 
-    uint8_t *dest = &I_VideoBuffer[yl * DOOM_W + dc_x];
+    pixel_t *dest = &I_VideoBuffer[yl * DISP_W + x_squeeze(dc_x)];
     for (int y = yl; y <= yh; y++) {
-        *dest = cmap[pixels[(frac >> FRACBITS) & 127]];
-        dest += DOOM_W;
+        *dest = clut[pixels[(frac >> FRACBITS) & 127]];
+        dest += DISP_W;
         frac += fracstep;
     }
 }
@@ -533,12 +544,14 @@ static void paint_textured_column(uint8_t fallback_colour)
     uint8_t col_buf[WHD_TEXTURE_COL_HEIGHT];
     decode_patch_column(col, col_buf, max_row);
 
-    const lighttable_t *cmap = colormaps + 256 * dc_colormap_index;
+    int cmi = dc_colormap_index;
+    if (cmi < 0) cmi = 0;
+    const uint16_t *clut = lit_lut[cmi];
 
-    uint8_t *dest = &I_VideoBuffer[yl * DOOM_W + dc_x];
+    pixel_t *dest = &I_VideoBuffer[yl * DISP_W + x_squeeze(dc_x)];
     for (int y = yl; y <= yh; y++) {
-        *dest = cmap[col_buf[(frac >> FRACBITS) & 127]];
-        dest += DOOM_W;
+        *dest = clut[col_buf[(frac >> FRACBITS) & 127]];
+        dest += DISP_W;
         frac += fracstep;
     }
 }
@@ -600,16 +613,15 @@ static void paint_sky_column(void)
 
     fixed_t fracstep = dc_iscale;
     fixed_t frac = dc_texturemid + (yl - centery) * fracstep;
-    /* Sky always uses colormap 0 (full bright); colormaps[0..255] is
-     * the identity map in PLAYPAL terms, so a direct write would
-     * also be correct, but keep the lookup symmetric with walls. */
-    const lighttable_t *cmap = colormaps;
+    /* Sky always uses colormap 0 (full bright). lit_lut[0] composes
+     * the identity colormap with the live palette into RGB565. */
+    const uint16_t *clut = lit_lut[0];
 
     const uint8_t *col_buf = sky_cache_data[col];
-    uint8_t *dest = &I_VideoBuffer[yl * DOOM_W + dc_x];
+    pixel_t *dest = &I_VideoBuffer[yl * DISP_W + x_squeeze(dc_x)];
     for (int y = yl; y <= yh; y++) {
-        *dest = cmap[col_buf[(frac >> FRACBITS) & 127]];
-        dest += DOOM_W;
+        *dest = clut[col_buf[(frac >> FRACBITS) & 127]];
+        dest += DISP_W;
         frac += fracstep;
     }
 }
@@ -688,11 +700,12 @@ static uint8_t  psprite_queue_segs[PSPRITE_QUEUE_SEG_BYTES];
 static uint16_t psprite_queue_count;
 static uint16_t psprite_queue_segs_used;
 
-/* Fuzz pattern: vanilla r_draw.c:309-318. Each entry is +DOOM_W or
- * -DOOM_W (one row down/up); we store the sign and apply * DOOM_W at
- * sample time. fuzzpos advances per pixel and wraps at 50, deliberately
- * persisting across columns / sprites / frames so the shimmer pattern
- * shifts continuously. */
+/* Fuzz pattern: vanilla r_draw.c:309-318. Each entry is +-1 row
+ * (the sample apply walks one row up or down). fuzzpos advances per
+ * pixel and wraps at 50, deliberately persisting across columns /
+ * sprites / frames so the shimmer pattern shifts continuously. The
+ * fuzz reads the already-rendered RGB565 neighbour and darkens it
+ * via the (rgb >> 1) & 0x7BEF mask (per-channel /2). */
 static const int8_t fuzz_dy[50] = {
     +1, -1, +1, -1, +1, +1, -1, +1, +1, -1,
     +1, +1, +1, -1, +1, +1, +1, -1, -1, -1,
@@ -800,9 +813,16 @@ static void render_queued_column(const sprite_queued_column_t *q,
      * runs after walls/floors are painted, so I_VideoBuffer holds the
      * already-rendered scenery underneath. */
     if (q->colormap_index < 0) {
-        const uint8_t *cmap = colormaps + 6 * 256;
+        /* Fuzz / spectre transparency. Vanilla samples a neighbour
+         * palette index through colormap 6 (a darkening colormap).
+         * In our RGB565 buffer there's no palette index to recover,
+         * so darken the neighbour pixel directly: shift every RGB565
+         * channel right by one bit (mask 0x7BEF clears the carry from
+         * R bit11 -> G bit10 and from G bit5 -> B bit4). Visually
+         * close to colormap[6] for the "dark wobble" look. */
         int x = q->x;
         if ((unsigned)x >= (unsigned)DOOM_W) return;
+        int xo = x_squeeze(x);
         const uint8_t *ys = &seg_buf[q->seg_offset];
         for (int s = 0; s < q->seg_count; s++) {
             int yl = ys[s * 3];
@@ -814,8 +834,9 @@ static void render_queued_column(const sprite_queued_column_t *q,
                 if (fuzzpos >= 50) fuzzpos = 0;
                 if (sy < 0) sy = 0;
                 else if (sy > DOOM_H - 1) sy = DOOM_H - 1;
-                I_VideoBuffer[y * DOOM_W + x] =
-                    cmap[I_VideoBuffer[sy * DOOM_W + x]];
+                uint16_t neighbour = I_VideoBuffer[sy * DISP_W + xo];
+                I_VideoBuffer[y * DISP_W + xo] =
+                    (uint16_t)((neighbour >> 1) & 0x7BEFu);
             }
         }
         return;
@@ -884,8 +905,9 @@ static void render_queued_column(const sprite_queued_column_t *q,
     fixed_t fracstep = q->iscale;
     /* Fuzz (colormap_index < 0) is handled via the early return at the
      * top of this function; here colormap_index is guaranteed >= 0. */
-    const lighttable_t *cmap = colormaps + 256 * q->colormap_index;
+    const uint16_t *clut = lit_lut[q->colormap_index];
     int x = q->x;
+    int xo = x_squeeze(x);
     const uint8_t *ys = &seg_buf[q->seg_offset];
 
     for (int s = 0; s < q->seg_count; s++) {
@@ -897,10 +919,10 @@ static void render_queued_column(const sprite_queued_column_t *q,
 
         fixed_t tex_mid_seg = q->texturemid - ((fixed_t)base_off << FRACBITS);
         fixed_t frac = tex_mid_seg + (yl - centery) * fracstep;
-        uint8_t *dest = &I_VideoBuffer[yl * DOOM_W + x];
+        pixel_t *dest = &I_VideoBuffer[yl * DISP_W + xo];
         for (int y = yl; y <= yh; y++) {
-            *dest = cmap[col_buf[(frac >> FRACBITS) & 127]];
-            dest += DOOM_W;
+            *dest = clut[col_buf[(frac >> FRACBITS) & 127]];
+            dest += DISP_W;
             frac += fracstep;
         }
     }
@@ -932,14 +954,20 @@ static void drain_sprite_queues(void)
  * E1M1's view typically shows 2-3 distinct flats at a time (CEIL5_1
  * + FLOOR4_8 + FLOOR0_1 ish), so a 4-slot LRU keeps the steady state
  * decode-free. */
-#define FLAT_CACHE_SLOTS 8
+/* Flat decoder LRU cache. Each slot is one 64x64 = 4096-byte tile.
+ * The RGB565 framebuffer refactor freed 64 KB (doom_fb removed) but
+ * spent ~16.5 KB on lit_lut and ~64 KB on the doubled wipe buffers,
+ * netting +16 KB BSS. We pay for it by dropping one flat slot. The
+ * E1M1 typical view shows 2-3 flats simultaneously, so 7 slots is
+ * still well above the steady-state miss boundary. */
+#define FLAT_CACHE_SLOTS 7
 #define FLAT_PIXELS      4096
 
 static uint8_t flat_cache[FLAT_CACHE_SLOTS][FLAT_PIXELS];
 static int     flat_cache_picnum[FLAT_CACHE_SLOTS] =
-    {-1, -1, -1, -1, -1, -1, -1, -1};
+    {-1, -1, -1, -1, -1, -1, -1};
 static uint8_t flat_cache_lru[FLAT_CACHE_SLOTS] =
-    {0, 1, 2, 3, 4, 5, 6, 7};
+    {0, 1, 2, 3, 4, 5, 6};
 
 static void decode_flat(int picnum, uint8_t *dst)
 {
@@ -1140,62 +1168,76 @@ void pd_add_plane_column(int x, int yl, int yh, fixed_t scale,
     fixed_t kx = FixedMul(plane_xcos[x], plane_h);
     fixed_t ky = FixedMul(plane_xsin[x], plane_h);
 
-    uint8_t *dest = &I_VideoBuffer[yl * DOOM_W + x];
+    pixel_t *dest = &I_VideoBuffer[yl * DISP_W + x_squeeze(x)];
     for (int y = yl; y <= yh; y++) {
         fixed_t world_x = viewx  + FixedMul(kx, yslope[y]);
         fixed_t world_y = -viewy - FixedMul(ky, yslope[y]);
         unsigned u = ((unsigned)world_x >> FRACBITS) & 63;
         unsigned v = ((unsigned)world_y >> FRACBITS) & 63;
-        const lighttable_t *cmap = colormaps + 256 * plane_light_level[y];
-        *dest = cmap[flat[(v << 6) | u]];
-        dest += DOOM_W;
+        const uint16_t *clut = lit_lut[plane_light_level[y]];
+        *dest = clut[flat[(v << 6) | u]];
+        dest += DISP_W;
     }
 }
 
 /* ---------- Wipe (melt) animation -------------------------------
- * The classic Doom screen melt. f_wipe.c is mostly compiled out
- * (NO_USE_WIPE=1), so we implement it locally. Two 64 KB buffers
- * snapshot the "from" (previous frame) and "to" (post-transition
- * frame) images; per-column y[] offsets advance per loop iteration
- * and we composite from + to into I_VideoBuffer based on those
- * offsets.
+ * The classic Doom screen melt, restored after the RGB565 ping-pong
+ * refactor. Standard implementations need two snapshot buffers
+ * ("from" and "to") plus a composite destination = 3 * 96 KB. We
+ * don't have the budget. Instead we exploit two facts about the
+ * ping-pong layout to skip extra storage entirely:
  *
- * Protocol with the engine:
- *   - D_Display calls pd_begin_frame, optionally renders the new
- *     frame (gated by `!wipestate || wipestate == WIPESTATE_REDRAW1`),
- *     then calls pd_end_frame(wipe). `wipe` is true only on the
- *     first frame after a gamestate change.
- *   - D_RunFrame loops `do { D_Display(); } while (wipestate);` so
- *     setting wipestate to anything non-zero re-enters D_Display.
- *   - At the end of every NORMAL (non-wipe) frame we snapshot
- *     I_VideoBuffer into wipe_from_buf so it's ready when a wipe
- *     suddenly starts on the next frame.
- *   - On the first wipe frame we save the new I_VideoBuffer into
- *     wipe_to_buf, restore wipe_from_buf into I_VideoBuffer, init
- *     the y[] table, and run one melt step. Subsequent loop
- *     iterations skip rendering (engine gate) and run further melt
- *     steps until y[i] >= DOOM_H for every column. */
-static uint8_t wipe_from_buf[DOOM_W * DOOM_H];
-static uint8_t wipe_to_buf[DOOM_W * DOOM_H];
-static int16_t wipe_y[DOOM_W];
+ *   1. At wipe-start the previously-displayed buffer (front_buf)
+ *      already holds the "from" image; the just-rendered buffer
+ *      (back_buf) holds the "to" image. They're our snapshots.
+ *   2. The melt is monotonic - wipe_y[i] only ever advances, so a
+ *      pixel that has shifted from "from" to "to" never reverts.
+ *
+ * That lets us composite IN PLACE on the "from" buffer: each step
+ * overwrites rows [0, wipe_y[i]) with pixels from "to". The "from"
+ * pixels we destroy are exactly the ones that no longer need to be
+ * read.
+ *
+ * During the wipe the engine's render gate is closed (D_Display only
+ * runs pd_begin_frame + pd_end_frame, no R_RenderPlayerView), so the
+ * buffers stay quiescent except for our composite + DMA. We use a
+ * synchronous DMA path during wipe (see i_video_begin_wipe /
+ * i_video_end_wipe in i_video_stm32.c) since the wipe is short and
+ * the simpler control flow is worth not having to track an in-flight
+ * DMA across composite steps.
+ *
+ * D_Display's `do { D_Display(); } while (wipestate);` loop in
+ * d_main.c:515 keeps re-entering as long as wipestate != NONE. We
+ * set wipestate to WIPESTATE_SKIP1 on the first wipe frame and clear
+ * it back to NONE when wipe_step_melt reports done. */
+static int16_t wipe_y[DISP_W];
+
+extern void           i_video_begin_wipe(void);
+extern void           i_video_end_wipe(void);
+extern pixel_t       *i_video_wipe_dest(void);
+extern const pixel_t *i_video_wipe_to(void);
 
 static void wipe_init_melt(void)
 {
+    /* Each column starts at a small random negative offset so the
+     * top edges of the new screen creep down at slightly staggered
+     * times. Smoothing between adjacent columns avoids a strobing
+     * look. Same constants as vanilla Doom's wipe_initMelt. */
     wipe_y[0] = -(int16_t)(M_Random() % 16);
-    for (int i = 1; i < DOOM_W; i++) {
+    for (int i = 1; i < DISP_W; i++) {
         int r = (M_Random() % 3) - 1;
         wipe_y[i] = wipe_y[i - 1] + (int16_t)r;
-        if (wipe_y[i] > 0)        wipe_y[i] = 0;
+        if (wipe_y[i] > 0)         wipe_y[i] = 0;
         else if (wipe_y[i] == -16) wipe_y[i] = -15;
     }
 }
 
-/* One tic of the melt. Returns 1 when every column has finished
- * sliding off the bottom (y[i] >= DOOM_H). */
+/* Advance one tic. Returns 1 when every column has scrolled all
+ * 200 rows ("from" fully replaced by "to"). */
 static int wipe_step_melt(void)
 {
     int done = 1;
-    for (int i = 0; i < DOOM_W; i++) {
+    for (int i = 0; i < DISP_W; i++) {
         if (wipe_y[i] < 0) {
             wipe_y[i]++;
             done = 0;
@@ -1209,27 +1251,21 @@ static int wipe_step_melt(void)
     return done;
 }
 
-/* Composite from + to into I_VideoBuffer based on current wipe_y[]:
- * for column i, screen rows [0, y[i]) come from wipe_to_buf and rows
- * [y[i], DOOM_H) come from wipe_from_buf scrolled down by y[i]. */
-static void wipe_composite(void)
+/* In-place composite: for each column i, overwrite rows
+ * [0, wipe_y[i]) of `composite` with the same rows from `to`. Rows
+ * below wipe_y[i] are left as-is (they're "from" content). */
+static void wipe_composite_inplace(pixel_t *composite, const pixel_t *to)
 {
-    for (int i = 0; i < DOOM_W; i++) {
+    for (int i = 0; i < DISP_W; i++) {
         int yi = wipe_y[i];
-        if (yi < 0) yi = 0;
+        if (yi <= 0) continue;
         if (yi > DOOM_H) yi = DOOM_H;
-        uint8_t *dst = &I_VideoBuffer[i];
-        const uint8_t *src_to = &wipe_to_buf[i];
+        pixel_t       *dst = &composite[i];
+        const pixel_t *src = &to[i];
         for (int y = 0; y < yi; y++) {
-            *dst = *src_to;
-            dst    += DOOM_W;
-            src_to += DOOM_W;
-        }
-        const uint8_t *src_from = &wipe_from_buf[i];
-        for (int y = yi; y < DOOM_H; y++) {
-            *dst = *src_from;
-            dst      += DOOM_W;
-            src_from += DOOM_W;
+            *dst = *src;
+            dst += DISP_W;
+            src += DISP_W;
         }
     }
 }
@@ -1246,6 +1282,13 @@ void pd_begin_frame(void)
         vpatchlists->framebuffer[0].header.max = VPATCHLIST_COUNT_FRAMEBUFFER;
         patchlist_initialized = 1;
     }
+
+    /* Sync v_video.c's dest_screen to the current I_VideoBuffer.
+     * I_VideoBuffer flips between two ping-pong buffers each frame;
+     * dest_screen was set once at startup by V_RestoreBuffer and would
+     * otherwise stay stuck on whichever buffer was current at init. */
+    extern void V_RestoreBuffer(void);
+    V_RestoreBuffer();
     /* No view-sized clipping; ST_Drawer / M_Drawer write across the
      * full 320x200 frame. */
     vpatch_clip_top    = 0;
@@ -1263,7 +1306,9 @@ void pd_begin_frame(void)
      * GS_LEVEL frames where the column callbacks will repaint
      * everything. */
     if (gamestate == GS_LEVEL && wipestate == WIPESTATE_NONE) {
-        memset(I_VideoBuffer, 0, DOOM_W * DOOM_H);
+        /* RGB565 0x0000 == black, so a byte-zero clear covers the
+         * whole 240*200 uint16_t buffer. */
+        memset(I_VideoBuffer, 0, DISP_W * DOOM_H * sizeof(pixel_t));
     }
     /* Plane lighting cache is keyed on visplane index; the index is
      * reused across frames for unrelated visplanes, so drop the cache
@@ -1289,7 +1334,11 @@ void pd_begin_frame(void)
  * Overwrites splash_decoder_buf / splash_prefix_lengths, so the
  * patch-decoder cache is invalidated.
  */
-static void splash_draw(int patch_num, int top, int bottom, uint8_t *dest)
+/* `dest_buf` is the RGB565 scan-out buffer (DISP_W stride). top/bottom
+ * are source rows in the 320x200 patch coordinate space; this function
+ * walks the whole 320 columns and writes only the kept ones into
+ * dest_buf at x_squeeze(col) per row. */
+static void splash_draw(int patch_num, int top, int bottom, pixel_t *dest_buf)
 {
     cached_patch_num = -1;
     const uint8_t *patch =
@@ -1341,7 +1390,10 @@ static void splash_draw(int patch_num, int top, int bottom, uint8_t *dest)
      * indexes into col_offsets again). */
     uint data_byte_index = (data_index + w) * 2 + 2;
 
-    uint32_t row_bytes_skipped = (bottom - top) * DOOM_W - 1;
+    /* For each source column we compute its squeezed dest x; the
+     * (col & 3) == 3 columns are not written but their data must
+     * still be consumed from the stream so the bit reader stays in
+     * sync with the next column's start. */
     for (int col = 0; col < w; col++) {
         uint16_t col_offset = col_offsets[col];
         if ((col_offset >> 8) == 0xff) {
@@ -1360,6 +1412,7 @@ static void splash_draw(int patch_num, int top, int bottom, uint8_t *dest)
              * never see it for the Doom shareware splash lumps. */
             return;
         }
+
         uint8_t prev_pixel = 0;
         int y;
         for (y = 0; y < top; y++) {
@@ -1371,19 +1424,25 @@ static void splash_draw(int patch_num, int top, int bottom, uint8_t *dest)
                 prev_pixel = (uint8_t)(prev_pixel + (p & 0xff) - 3);
             }
         }
+
+        int keep = ((col & 3) != 3);
+        pixel_t *dest = keep ? &dest_buf[top * DISP_W + x_squeeze(col)]
+                             : NULL;
         for (; y < bottom; y++) {
             uint16_t p = th_decode_table_special_16(splash_decoder_buf,
                                                    splash_prefix_lengths, &bi);
+            uint8_t pi;
             if (p < 256) {
-                *dest = (uint8_t)p;
+                pi = (uint8_t)p;
             } else {
-                *dest = (uint8_t)(prev_pixel + (p & 0xff) - 3);
+                pi = (uint8_t)(prev_pixel + (p & 0xff) - 3);
             }
-            prev_pixel = *dest;
-            dest += DOOM_W;
+            prev_pixel = pi;
+            if (keep) {
+                *dest = palette_rgb565[pi];
+                dest += DISP_W;
+            }
         }
-        /* Step back to row `top` of the next column. */
-        dest -= row_bytes_skipped;
     }
 }
 
@@ -1435,6 +1494,7 @@ static const uint8_t fps_font[10][7] = {
 static void fps_paint_digit(int x, int y, int d)
 {
     if (d < 0 || d > 9) return;
+    uint16_t fg = palette_rgb565[FPS_DIGIT_FG];
     for (int row = 0; row < 7; row++) {
         uint8_t bits = fps_font[d][row];
         for (int col = 0; col < 5; col++) {
@@ -1444,10 +1504,12 @@ static void fps_paint_digit(int x, int y, int d)
             for (int sy = 0; sy < FPS_GLYPH_SCALE; sy++) {
                 int yy = py + sy;
                 if ((unsigned)yy >= (unsigned)DOOM_H) continue;
-                uint8_t *p = &I_VideoBuffer[yy * DOOM_W + px];
+                pixel_t *p = &I_VideoBuffer[yy * DISP_W];
                 for (int sx = 0; sx < FPS_GLYPH_SCALE; sx++) {
                     int xx = px + sx;
-                    if ((unsigned)xx < (unsigned)DOOM_W) p[sx] = FPS_DIGIT_FG;
+                    if ((unsigned)xx >= (unsigned)DOOM_W) continue;
+                    if ((xx & 3) == 3) continue;   /* dropped column */
+                    p[x_squeeze(xx)] = fg;
                 }
             }
         }
@@ -1464,13 +1526,17 @@ static void draw_big_fps(int fps)
     int x = DOOM_W - 4 - total_w;
     int y = 2;
 
+    uint16_t bg = palette_rgb565[FPS_DIGIT_BG];
+
     /* Black inset for contrast - 1 px past each edge of the glyph
      * cluster. */
     for (int yy = y - 1; yy < y + FPS_GLYPH_H + 1; yy++) {
         if ((unsigned)yy >= (unsigned)DOOM_H) continue;
-        uint8_t *row = &I_VideoBuffer[yy * DOOM_W];
+        pixel_t *row = &I_VideoBuffer[yy * DISP_W];
         for (int xx = x - 2; xx < x + total_w + 2; xx++) {
-            if ((unsigned)xx < (unsigned)DOOM_W) row[xx] = FPS_DIGIT_BG;
+            if ((unsigned)xx >= (unsigned)DOOM_W) continue;
+            if ((xx & 3) == 3) continue;
+            row[x_squeeze(xx)] = bg;
         }
     }
 
@@ -1521,20 +1587,24 @@ void pd_end_frame(int wipe_start)
          * which overwrites the text when F_Ticker advances stages -
          * no special handling needed for that transition. */
         {
-            static gamestate_t finale_prev = (gamestate_t)-1;
             if (gamestate == GS_FINALE) {
-                if (finale_prev != GS_FINALE && finaleflat) {
+                /* Re-tile the finaleflat every frame: with ping-pong
+                 * back-buffers the previously-tiled buffer is only
+                 * one of two, so we redraw to keep both in sync. The
+                 * tile is cheap (~0.6 ms; 240*200 LUT loads). */
+                if (finaleflat) {
                     int flat_lump = W_CheckNumForName(finaleflat);
                     if (flat_lump >= 0) {
                         int picnum = flat_lump - firstflat;
                         if (picnum >= 0) {
                             const uint8_t *src = load_flat(picnum);
                             for (int y = 0; y < DOOM_H; y++) {
-                                uint8_t *dst = I_VideoBuffer + y * DOOM_W;
+                                pixel_t *dst = I_VideoBuffer + y * DISP_W;
                                 const uint8_t *row = src + ((y & 63) << 6);
-                                for (int x = 0; x < DOOM_W; x += 64) {
-                                    int cw = (DOOM_W - x) < 64 ? (DOOM_W - x) : 64;
-                                    memcpy(dst + x, row, cw);
+                                for (int x = 0; x < DOOM_W; x++) {
+                                    if ((x & 3) == 3) continue;
+                                    dst[x_squeeze(x)] =
+                                        palette_rgb565[row[x & 63]];
                                 }
                             }
                         }
@@ -1543,7 +1613,6 @@ void pd_end_frame(int wipe_start)
                 V_BeginPatchList(vpatchlists->framebuffer);
                 F_Drawer();
             }
-            finale_prev = gamestate;
         }
 
         /* Drain sprites here, after R_RenderPlayerView has emitted all
@@ -1618,36 +1687,28 @@ void pd_end_frame(int wipe_start)
         }
 
         if (wipe_start) {
-            /* Gamestate just changed. I_VideoBuffer holds the new
-             * frame; wipe_from_buf still holds the snapshot from the
-             * end of the previous frame. Save the new frame as "to",
-             * restore the old frame into I_VideoBuffer, init the y[]
-             * table, and run + blit the first melt step. The engine's
-             * do/while loop will keep re-entering D_Display until
-             * wipestate returns to NONE. */
-            memcpy(wipe_to_buf, I_VideoBuffer, sizeof(wipe_to_buf));
-            memcpy(I_VideoBuffer, wipe_from_buf, sizeof(wipe_from_buf));
+            /* Gamestate just changed. The previously-displayed
+             * front_buf in i_video_stm32.c holds the "from" image;
+             * back_buf holds the new "to" image we just rendered.
+             * Hand both to the video glue, init the per-column melt
+             * y-table, and run the first composite step. */
+            i_video_begin_wipe();
             wipe_init_melt();
             wipestate = WIPESTATE_SKIP1;
-            (void)wipe_step_melt();
-            wipe_composite();
-        } else {
-            /* No wipe pending. Snapshot this frame so it's available
-             * as the "from" image if the next frame triggers a wipe. */
-            memcpy(wipe_from_buf, I_VideoBuffer, sizeof(wipe_from_buf));
+            wipe_step_melt();
+            wipe_composite_inplace(i_video_wipe_dest(),
+                                   i_video_wipe_to());
         }
     } else {
-        /* Mid-wipe iteration. Engine skipped the render gate, so the
-         * framebuffer is whatever we left it (the previous melt
-         * composite). Advance one tic and re-composite. */
+        /* Mid-wipe iteration. Engine's render gate is closed so
+         * I_VideoBuffer hasn't been touched. Step the melt one tic
+         * and re-composite into the same buffer. */
         int done = wipe_step_melt();
-        wipe_composite();
+        wipe_composite_inplace(i_video_wipe_dest(),
+                               i_video_wipe_to());
         if (done) {
             wipestate = WIPESTATE_NONE;
-            /* Lock in the final image and use it as next frame's
-             * "from" snapshot. */
-            memcpy(I_VideoBuffer, wipe_to_buf, sizeof(wipe_to_buf));
-            memcpy(wipe_from_buf, wipe_to_buf, sizeof(wipe_from_buf));
+            i_video_end_wipe();
         }
     }
 

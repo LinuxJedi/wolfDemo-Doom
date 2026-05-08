@@ -4,6 +4,7 @@
 #include "board.h"
 #include "uart.h"
 #include "st7789.h"
+#include "doom_glue/perf.h"
 
 /* The Doom engine entry point. D_DoomMain drives Z_Init, W_AddFile,
  * R_Init, P_Init, and ultimately D_DoomLoop -- it never returns. */
@@ -109,6 +110,10 @@ int main(void)
 
     /* Stage 2: SysTick @ 1 kHz */
     SysTick_Config(SystemCoreClock / 1000u);
+
+    /* DWT cycle counter for perf brackets (perf.h). Safe to leave on
+     * permanently; no measurable runtime cost. */
+    perf_init();
 
     /* Stage 3: WAD probe */
     extern const uint8_t _wad_start[], _wad_end[];

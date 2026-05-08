@@ -18,6 +18,11 @@
 
 #define TSIZE_MAX 65535u
 
+/* Halfword-DMA byte cap. GPDMA's CBR1.BNDT is a 16-bit byte count;
+ * with halfword src/dst widths it must be a multiple of 2, so the
+ * largest legal chunk is 65534 bytes. */
+#define DMA_HW_BYTES_MAX 65534u
+
 void spi_init(void)
 {
     /* Select SYSCLK (160 MHz) as the SPI1 kernel clock source
@@ -226,11 +231,17 @@ static void spi_dma_init_once(void)
     ch->CCR = 0;
     /* Clear all the per-channel pending flags. */
     ch->CFCR = 0xFFFFFFFFu;
-    /* CTR1: source byte-wide, increment source; destination byte-wide,
-     * fixed (the SPI TXDR is one register). All access through AHB
-     * port 0 (SAP/DAP both 0). Burst length defaults to 1 (PBL_LOG2 =
-     * 0), data widths default to byte (SDW/DDW = 0). */
-    ch->CTR1 = DMA_CTR1_SINC;
+    /* CTR1: source halfword (2 bytes), increment source; destination
+     * halfword, fixed (the SPI TXDR is one register, byte-addressable
+     * but accepts a 16-bit write per transfer). All access through AHB
+     * port 0 (SAP/DAP both 0). Burst length defaults to 1 (PBL_LOG2 = 0).
+     * SDW_LOG2 = DDW_LOG2 = 1 means each transfer moves one 16-bit unit;
+     * paired with SPI1 DSIZE = 15 (set per-blit by the start funcs)
+     * the SPI shifts out 16 bits per DMA transfer, halving DMA bus
+     * traffic and FIFO refill events. */
+    ch->CTR1 = DMA_CTR1_SINC
+             | (1u << DMA_CTR1_SDW_LOG2_Pos)
+             | (1u << DMA_CTR1_DDW_LOG2_Pos);
     /* CTR2: peripheral request, request line 7 = SPI1_TX. DREQ=1
      * means the peripheral signals readiness for each transfer (the
      * destination peripheral controls flow). */
@@ -243,10 +254,11 @@ void spi_dma_blit_start(const uint8_t *data, size_t len)
 {
     spi_dma_init_once();
     if (len == 0) return;
-    /* TSIZE is 16-bit; if the caller ever exceeds 65535 bytes per call,
-     * fall back to polled chunking. The framebuffer blit only ever
-     * sends 480-byte rows, so this is just defence-in-depth. */
-    if (len > TSIZE_MAX) {
+    /* Caller passes byte count; the SPI runs in 16-bit DSIZE so one
+     * frame == 2 bytes. GPDMA CBR1.BNDT caps at 65534 bytes per chunk
+     * (halfword-aligned) and the buffer must be even-length. The
+     * caller never exceeds 480-byte rows in practice. */
+    if (len > DMA_HW_BYTES_MAX || (len & 1u)) {
         spi_write(data, len);
         return;
     }
@@ -256,12 +268,15 @@ void spi_dma_blit_start(const uint8_t *data, size_t len)
     if (spi_dma_in_flight) spi_dma_blit_wait();
 
     /* SPI side: replicate the polled-path init sequence so we recover
-     * if MODF auto-cleared MASTER. */
+     * if MODF auto-cleared MASTER. DSIZE=15 = 16-bit frames; restored
+     * to 7 (8-bit) by spi_dma_blit_wait so polled command writes work. */
     SPI1->CR1  = SPI_CR1_SSI;
     SPI1->IFCR = SPI_IFCR_ALL;
     SPI1->CFG2 = SPI_CFG2_MASTER | SPI_CFG2_SSM | SPI_CFG2_COMM_0;
-    SPI1->CR2  = (uint32_t)len;
-    SPI1->CFG1 |= SPI_CFG1_TXDMAEN;     /* SPI now sources from DMA */
+    SPI1->CFG1 = (SPI1->CFG1 & ~SPI_CFG1_DSIZE)
+               | (15u << SPI_CFG1_DSIZE_Pos);
+    SPI1->CR2  = (uint32_t)(len / 2u);   /* TSIZE counts 16-bit frames */
+    SPI1->CFG1 |= SPI_CFG1_TXDMAEN;      /* SPI now sources from DMA */
     SPI1->CR1  = SPI_CR1_SSI | SPI_CR1_SPE;
 
     /* DMA side: source = caller's buffer, byte count = len, then arm.
@@ -304,9 +319,13 @@ void spi_dma_blit_wait(void)
         if (--guard == 0) { spi_last_sr = SPI1->SR; break; }
     }
 
-    SPI1->CFG1 &= ~SPI_CFG1_TXDMAEN;
-    SPI1->IFCR = SPI_IFCR_ALL;
+    /* Drop SPE FIRST. STM32U5 SPI locks DSIZE (and most CFG1 bits)
+     * while SPE=1, so the DSIZE=7 restore must happen afterwards. */
     SPI1->CR1  = SPI_CR1_SSI;             /* SPE off */
+    SPI1->CFG1 &= ~SPI_CFG1_TXDMAEN;
+    SPI1->CFG1 = (SPI1->CFG1 & ~SPI_CFG1_DSIZE)
+               | (7u << SPI_CFG1_DSIZE_Pos);
+    SPI1->IFCR = SPI_IFCR_ALL;
     ch->CCR    = 0;                       /* channel disable */
     ch->CFCR   = 0xFFFFFFFFu;
     spi_dma_in_flight = 0;
@@ -343,8 +362,10 @@ static void async_program_chunk(void)
 {
     /* Program GPDMA channel 0 with the next chunk of async_data. The
      * SPI is already in continuous mode and SPE-on, so as soon as the
-     * channel re-enables it'll start consuming bytes via TXP. */
-    size_t chunk = async_remaining > TSIZE_MAX ? TSIZE_MAX : async_remaining;
+     * channel re-enables it'll start consuming bytes via TXP. Chunks
+     * must be halfword-aligned for the 16-bit DMA path. */
+    size_t chunk = async_remaining > DMA_HW_BYTES_MAX
+                 ? DMA_HW_BYTES_MAX : async_remaining;
 
     DMA_Channel_TypeDef *ch = GPDMA1_Channel0;
     ch->CFCR = 0xFFFFFFFFu;
@@ -379,10 +400,14 @@ void spi_blit_async_start(const uint8_t *data, size_t total_len)
 
     /* Configure SPI for continuous transfer: TSIZE=0 means it keeps
      * clocking until SPE drops or CSUSP fires. CFG2 re-asserted to
-     * recover from any MODF that auto-cleared MASTER. */
+     * recover from any MODF that auto-cleared MASTER. DSIZE=15 puts
+     * the peripheral into 16-bit frame mode; spi_blit_async_wait
+     * restores DSIZE=7 so polled command writes work between blits. */
     SPI1->CR1   = SPI_CR1_SSI;
     SPI1->IFCR  = SPI_IFCR_ALL;
     SPI1->CFG2  = SPI_CFG2_MASTER | SPI_CFG2_SSM | SPI_CFG2_COMM_0;
+    SPI1->CFG1  = (SPI1->CFG1 & ~SPI_CFG1_DSIZE)
+                | (15u << SPI_CFG1_DSIZE_Pos);
     SPI1->CR2   = 0;                              /* TSIZE = continuous */
     SPI1->CFG1 |= SPI_CFG1_TXDMAEN;
     SPI1->CR1   = SPI_CR1_SSI | SPI_CR1_SPE;
@@ -419,9 +444,13 @@ void spi_blit_async_wait(void)
     while ((SPI1->SR & SPI_SR_TXC) == 0) {
         if (--guard == 0) { spi_last_sr = SPI1->SR; break; }
     }
-    SPI1->CFG1 &= ~SPI_CFG1_TXDMAEN;
-    SPI1->IFCR  = SPI_IFCR_ALL;
+    /* Drop SPE FIRST. STM32U5 SPI locks DSIZE (and most CFG1 bits)
+     * while SPE=1, so the DSIZE=7 restore must happen afterwards. */
     SPI1->CR1   = SPI_CR1_SSI;             /* SPE off */
+    SPI1->CFG1 &= ~SPI_CFG1_TXDMAEN;
+    SPI1->CFG1  = (SPI1->CFG1 & ~SPI_CFG1_DSIZE)
+                | (7u << SPI_CFG1_DSIZE_Pos);
+    SPI1->IFCR  = SPI_IFCR_ALL;
     NVIC_DisableIRQ(GPDMA1_Channel0_IRQn);
     async_state = ASYNC_IDLE;
 }

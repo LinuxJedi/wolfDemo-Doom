@@ -61,6 +61,7 @@ static uint64_t             pause_offset_us;
 static int                  opl_paused;
 static int                  music_initialized;
 static int                  music_volume_pct = 100;
+static int                  music_muted;        /* SW4 mute flag; see I_EnableMusic */
 
 /* Engine-side externs that i_oplmusic.c reads. snd_samplerate is
  * referenced by I_OPL_InitMusic (line 1808 of i_oplmusic.c) to call
@@ -243,28 +244,38 @@ void music_render_chunk(int16_t *out, int n)
             }
         }
 
-        /* Map output samples to native samples: native = output * (49716/11025)
-         * = output * 4.5089... The integer ratio is close enough; sample-rate
-         * drift accumulates slowly over a track but doesn't cause perceptible
-         * pitch error in chiptune-style OPL music. */
-        int n_native = (chunk * MUSIC_NATIVE_RATE) / MUSIC_SAMPLE_RATE;
-        if (n_native < 1) n_native = 1;
-        if (n_native > NATIVE_BATCH_MAX) n_native = NATIVE_BATCH_MAX;
+        if (music_muted) {
+            /* User muted music via SW4. Skip the per-sample emu8950
+             * call entirely (saves the bulk of the music CPU cost)
+             * and emit silence. Time still advances below; OPL_paused
+             * causes pause_offset_us to absorb it so MIDI callback
+             * deadlines aren't backed up when the user un-mutes. */
+            memset(out + filled, 0, chunk * sizeof(int16_t));
+        } else {
+            /* Map output samples to native samples: native = output *
+             * (49716/11025) = output * 4.5089... The integer ratio is
+             * close enough; sample-rate drift accumulates slowly over
+             * a track but doesn't cause perceptible pitch error in
+             * chiptune-style OPL music. */
+            int n_native = (chunk * MUSIC_NATIVE_RATE) / MUSIC_SAMPLE_RATE;
+            if (n_native < 1) n_native = 1;
+            if (n_native > NATIVE_BATCH_MAX) n_native = NATIVE_BATCH_MAX;
 
-        OPL_calc_buffer_linear(emu8950_opl, emu_scratch, (uint32_t)n_native);
+            OPL_calc_buffer_linear(emu8950_opl, emu_scratch, (uint32_t)n_native);
 
-        /* Decimate native -> output via Bresenham-style accumulator
-         * (n_native steps of n_native into chunk steps of chunk).
-         * Avoids a per-sample integer divide; aliasing is mild because
-         * Doom OPL music spectrum sits well below the decimation
-         * Nyquist (~5.5 kHz). */
-        int idx = 0, err = 0;
-        for (int i = 0; i < chunk; i++) {
-            out[filled + i] = (int16_t)(emu_scratch[idx] & 0xFFFF);
-            err += n_native;
-            while (err >= chunk) {
-                err -= chunk;
-                idx++;
+            /* Decimate native -> output via Bresenham-style accumulator
+             * (n_native steps of n_native into chunk steps of chunk).
+             * Avoids a per-sample integer divide; aliasing is mild because
+             * Doom OPL music spectrum sits well below the decimation
+             * Nyquist (~5.5 kHz). */
+            int idx = 0, err = 0;
+            for (int i = 0; i < chunk; i++) {
+                out[filled + i] = (int16_t)(emu_scratch[idx] & 0xFFFF);
+                err += n_native;
+                while (err >= chunk) {
+                    err -= chunk;
+                    idx++;
+                }
             }
         }
         filled += chunk;
@@ -298,15 +309,25 @@ extern const music_module_t music_opl_module;
  * firings. */
 static int music_enabled = 1;
 
+/* SW4 mutes music via OPL_SetPaused (preserves song iterators in
+ * i_oplmusic.c and the emulator voice/envelope state) and by
+ * short-circuiting the per-sample emu8950 generator above in
+ * music_render_chunk. The earlier I_EnableMusic(0) implementation
+ * called music_opl_module.Shutdown() which destroyed num_tracks via
+ * I_OPL_StopSong, leaving no path to bring music back on - that's
+ * what made the toggle one-way. */
 void I_EnableMusic(int enable)
 {
-    if (enable && !music_initialized) {
-        if (music_opl_module.Init()) {
+    if (enable) {
+        /* Initial bring-up if music was never started. */
+        if (!music_initialized && music_opl_module.Init()) {
             music_initialized = 1;
         }
-    } else if (!enable && music_initialized) {
-        music_opl_module.Shutdown();
-        music_initialized = 0;
+        music_muted = 0;
+        if (music_initialized) OPL_SetPaused(0);
+    } else {
+        music_muted = 1;
+        if (music_initialized) OPL_SetPaused(1);
     }
     music_enabled = enable ? 1 : 0;
 }
