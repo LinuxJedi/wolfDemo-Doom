@@ -64,6 +64,7 @@
 #include "picodoom.h"
 
 #include "i_video_lut.h"
+#include "perf.h"
 
 extern pixel_t *I_VideoBuffer;
 extern void I_FinishUpdate(void);
@@ -638,10 +639,13 @@ void pd_add_column(pd_column_type type)
      * for a single transition tic - barely perceptible since the panel
      * never sees those columns anyway). */
     if ((dc_x & 3) == 3) return;
+#if PERF_INSTRUMENT
+    uint32_t perf_paint_t = perf_cyc();
+#endif
     switch (type) {
-        case PDCOL_TOP:    paint_textured_column(COLOUR_TOP);    return;
-        case PDCOL_MID:    paint_textured_column(COLOUR_MID);    return;
-        case PDCOL_BOTTOM: paint_textured_column(COLOUR_BOTTOM); return;
+        case PDCOL_TOP:    paint_textured_column(COLOUR_TOP);    break;
+        case PDCOL_MID:    paint_textured_column(COLOUR_MID);    break;
+        case PDCOL_BOTTOM: paint_textured_column(COLOUR_BOTTOM); break;
         case PDCOL_SKY:
             /* r_segs.c's sky path sets dc_iscale = pspriteiscale (no
              * perspective), dc_colormap_index = 0 (full bright), and
@@ -650,9 +654,12 @@ void pd_add_column(pd_column_type type)
              * patch handle. Specialize the paint to use the sky cache
              * - skips the per-frame Huffman decode after warmup. */
             paint_sky_column();
-            return;
+            break;
         default: return; /* MASKED, NONE, etc. -- skip */
     }
+#if PERF_INSTRUMENT
+    perf_paint_us += perf_us_since(perf_paint_t);
+#endif
 }
 
 /* ---------- Sprite column queue --------------------------------
@@ -1566,11 +1573,25 @@ void pd_begin_frame(void)
      * closed, so the framebuffer holds our melt composite from the
      * previous iteration. Don't clear it. Only clear on normal
      * GS_LEVEL frames where the column callbacks will repaint
-     * everything. */
+     * everything.
+     *
+     * Note: this memset has a 4-30 ms range. The floor (~3.6 ms) is
+     * the native AHB-bound time for a 96 KB clear; the spikes are
+     * PendSV preemption from the audio mix_chunk path (TIM6 pends
+     * PendSV at chunk boundaries every ~46 ms; mix_chunk runs the
+     * OPL synth for 5-30 ms). Moving the memset doesn't help since
+     * PendSV is independent of frame phase. The real fix would be a
+     * GPDMA m2m clear running in background, but that's deferred. */
     if (gamestate == GS_LEVEL && wipestate == WIPESTATE_NONE) {
         /* RGB565 0x0000 == black, so a byte-zero clear covers the
          * whole 240*200 uint16_t buffer. */
+#if PERF_INSTRUMENT
+        uint32_t perf_t = perf_cyc();
+#endif
         memset(I_VideoBuffer, 0, DISP_W * DOOM_H * sizeof(pixel_t));
+#if PERF_INSTRUMENT
+        perf_clear_us += perf_us_since(perf_t);
+#endif
     }
     /* Touched-visplane bookkeeping is reset by pd_finalize_planes when
      * it drains the buffer; nothing to do here on the BSP-emit side. */
@@ -1887,7 +1908,13 @@ void pd_end_frame(int wipe_start)
          * fill the silhouette below the wall sweeps. Sprites then
          * draw on top of both. */
         if (gamestate == GS_LEVEL) {
+#if PERF_INSTRUMENT
+            uint32_t perf_t = perf_cyc();
+#endif
             pd_finalize_planes();
+#if PERF_INSTRUMENT
+            perf_planes_us += perf_us_since(perf_t);
+#endif
         }
 
         /* Drain sprites here, after R_RenderPlayerView has emitted all
@@ -1896,7 +1923,13 @@ void pd_end_frame(int wipe_start)
          * sits on top of enemies. The HUD (ST_Drawer / V_DrawPatchList)
          * draws after this, on top of everything. */
         if (gamestate == GS_LEVEL) {
+#if PERF_INSTRUMENT
+            uint32_t perf_t = perf_cyc();
+#endif
             drain_sprite_queues();
+#if PERF_INSTRUMENT
+            perf_sprites_us += perf_us_since(perf_t);
+#endif
         }
 
         /* Status bar widgets (face, ammo, health, armour, keys, and the
@@ -1906,10 +1939,24 @@ void pd_end_frame(int wipe_start)
          * of the silhouette. The fullscreen=false argument flips
          * st_statusbaron on so the widgets actually emit. */
         if (gamestate == GS_LEVEL) {
+#if PERF_INSTRUMENT
+            uint32_t perf_t = perf_cyc();
+#endif
             ST_Drawer(false, true);
+#if PERF_INSTRUMENT
+            perf_hud_us += perf_us_since(perf_t);
+#endif
         }
         /* Menu (only renders when menuactive); no-op in attract demo. */
+#if PERF_INSTRUMENT
+        {
+            uint32_t perf_t = perf_cyc();
+            M_Drawer();
+            perf_hud_us += perf_us_since(perf_t);
+        }
+#else
         M_Drawer();
+#endif
 
         /* Advance the pre-wipe state machine one frame. g_game.c
          * holds back ga_newgame / ga_loadlevel / ga_completed /
@@ -1952,7 +1999,15 @@ void pd_end_frame(int wipe_start)
 
         /* Drain the patchlist into I_VideoBuffer (dest_screen was pointed
          * here by V_RestoreBuffer in d_main.c before the game loop). */
+#if PERF_INSTRUMENT
+        {
+            uint32_t perf_t = perf_cyc();
+            V_DrawPatchList(vpatchlists->framebuffer);
+            perf_hud_us += perf_us_since(perf_t);
+        }
+#else
         V_DrawPatchList(vpatchlists->framebuffer);
+#endif
 
         /* Large FPS overlay on top of everything. The engine's built-in
          * widget at (318, 2) is too small to read on the click panel;

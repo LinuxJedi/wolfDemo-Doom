@@ -100,6 +100,7 @@
 #include "w_wad.h"
 #include "z_zone.h"
 #include "doom/sounds.h"
+#include "perf.h"
 
 #define AUDIO_SAMPLE_RATE   11025u
 /* HALF_SAMPLES = 1024 means each chunk covers ~93 ms of audio.
@@ -451,9 +452,18 @@ void TIM6_IRQHandler(void)
     DAC1->DHR12R1 = ring_buf[rd];
     rd++;
     if (rd == HALF_SAMPLES) {
+#if PERF_INSTRUMENT
+        /* Underrun: a refill request from the previous chunk boundary
+         * is still pending, so PendSV hasn't refreshed the half we're
+         * about to start consuming. Samples will be stale. */
+        if (refill_request) perf_audio_under++;
+#endif
         refill_request |= REFILL_LOWER_HALF;
         SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
     } else if (rd == RING_SAMPLES) {
+#if PERF_INSTRUMENT
+        if (refill_request) perf_audio_under++;
+#endif
         refill_request |= REFILL_UPPER_HALF;
         SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
         rd = 0;

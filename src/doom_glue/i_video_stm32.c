@@ -73,6 +73,24 @@ static uint16_t *back_buf  = scan_buf_a;
 static pixel_t *wipe_dest;
 static pixel_t *wipe_src;
 
+#if PERF_INSTRUMENT
+/* Per-frame us accumulators, written by subsystem brackets in
+ * pd_stubs.c / r_main.c, consumed and zeroed by the [perf] printer
+ * below. */
+uint32_t perf_clear_us;
+uint32_t perf_bsp_us;
+uint32_t perf_paint_us;
+uint32_t perf_planes_us;
+uint32_t perf_sprites_us;
+uint32_t perf_hud_us;
+
+/* Silent-failure counters. */
+uint32_t perf_tic_skip;
+uint32_t perf_audio_under;
+uint32_t perf_dma_err;
+uint32_t perf_spi_trip;
+#endif
+
 /* Active 256-entry RGB565 palette in native byte order. SPI MSB-first
  * shifting + halfword DMA = wire-correct without an extra byte-swap.
  * Filled by I_SetPalette / I_SetPaletteNum. Used by the patchlist
@@ -241,12 +259,17 @@ void I_FinishUpdate(void)
 
 #if PERF_INSTRUMENT
     static uint32_t perf_frame_t0;          /* set on previous I_FinishUpdate exit */
-    static uint64_t perf_total_us, perf_blit_wait_us;
+    static perf_metric_t perf_total, perf_blit_wait;
+    static perf_metric_t perf_clear, perf_bsp, perf_paint, perf_planes, perf_sprites, perf_hud;
     static uint32_t perf_frames;
     static uint32_t perf_window_start_ms;
+    static uint32_t perf_blit_wait_frame_us;
+    static uint32_t perf_total_frame_us;
 
     if (perf_frame_t0 != 0) {
-        perf_total_us += perf_us_since(perf_frame_t0);
+        perf_total_frame_us = perf_us_since(perf_frame_t0);
+    } else {
+        perf_total_frame_us = 0;
     }
 #endif
 
@@ -260,7 +283,7 @@ void I_FinishUpdate(void)
     spi_blit_async_wait();
     st7789_blit_end();
 #if PERF_INSTRUMENT
-    perf_blit_wait_us += perf_us_since(perf_t);
+    perf_blit_wait_frame_us = perf_us_since(perf_t);
 #endif
 
     /* No conversion pass: column drawers wrote RGB565 directly into
@@ -301,23 +324,83 @@ void I_FinishUpdate(void)
     }
 
 #if PERF_INSTRUMENT
+    /* Fold this frame's per-subsystem totals into the window metrics
+     * and zero the per-frame accumulators so next frame starts clean. */
+    perf_metric_track(&perf_total,     perf_total_frame_us);
+    perf_metric_track(&perf_blit_wait, perf_blit_wait_frame_us);
+    perf_metric_track(&perf_clear,     perf_clear_us);
+    perf_metric_track(&perf_bsp,       perf_bsp_us);
+    perf_metric_track(&perf_paint,     perf_paint_us);
+    perf_metric_track(&perf_planes,    perf_planes_us);
+    perf_metric_track(&perf_sprites,   perf_sprites_us);
+    perf_metric_track(&perf_hud,       perf_hud_us);
+    perf_clear_us = perf_bsp_us = perf_paint_us = perf_planes_us = 0;
+    perf_sprites_us = perf_hud_us = 0;
+
+    /* Tic-skip detection: if I_GetTime advanced by more than one tic
+     * since the previous frame, the frame stalled past 1/35 s and we
+     * lost ground. perf_tic_skip is the cumulative count of dropped
+     * tics in the window (delta-1 per stalled frame). */
+    extern int I_GetTime(void);
+    static int perf_last_tic = -1;
+    int cur_tic = I_GetTime();
+    if (perf_last_tic >= 0) {
+        int dt = cur_tic - perf_last_tic;
+        if (dt > 1) perf_tic_skip += (uint32_t)(dt - 1);
+    }
+    perf_last_tic = cur_tic;
+
     perf_frames++;
     extern int I_GetTimeMS(void);
     int now_ms = I_GetTimeMS();
     if (perf_window_start_ms == 0) perf_window_start_ms = now_ms;
     if ((now_ms - perf_window_start_ms) >= 1000 && perf_frames > 0) {
         uint32_t fps = perf_frames;
-        uint32_t blit_wait_avg = (uint32_t)(perf_blit_wait_us / perf_frames);
-        uint32_t total_avg     = (uint32_t)(perf_total_us     / perf_frames);
-        /* render_us is the rest of the frame: total - blit_wait. */
-        uint32_t render_avg = total_avg > blit_wait_avg
-            ? total_avg - blit_wait_avg : 0;
-        printf("[perf] render=%lu us blit_wait=%lu us total=%lu us fps=%lu\r\n",
-               (unsigned long)render_avg,
-               (unsigned long)blit_wait_avg,
+        uint32_t total_avg   = (uint32_t)(perf_total.sum     / perf_frames);
+        uint32_t blit_avg    = (uint32_t)(perf_blit_wait.sum / perf_frames);
+        uint32_t clear_avg   = (uint32_t)(perf_clear.sum     / perf_frames);
+        uint32_t bsp_avg     = (uint32_t)(perf_bsp.sum       / perf_frames);
+        uint32_t paint_avg   = (uint32_t)(perf_paint.sum     / perf_frames);
+        uint32_t planes_avg  = (uint32_t)(perf_planes.sum    / perf_frames);
+        uint32_t sprites_avg = (uint32_t)(perf_sprites.sum   / perf_frames);
+        uint32_t hud_avg     = (uint32_t)(perf_hud.sum       / perf_frames);
+
+        printf("[perf] fps=%lu total=%lu/%lu/%lu blit=%lu/%lu "
+               "bsp=%lu/%lu paint=%lu/%lu planes=%lu/%lu sprites=%lu/%lu "
+               "hud=%lu/%lu clear=%lu/%lu",
+               (unsigned long)fps,
                (unsigned long)total_avg,
-               (unsigned long)fps);
-        perf_total_us = perf_blit_wait_us = 0;
+               (unsigned long)perf_total.max2,
+               (unsigned long)perf_total.max1,
+               (unsigned long)blit_avg,
+               (unsigned long)perf_blit_wait.max1,
+               (unsigned long)bsp_avg,     (unsigned long)perf_bsp.max1,
+               (unsigned long)paint_avg,   (unsigned long)perf_paint.max1,
+               (unsigned long)planes_avg,  (unsigned long)perf_planes.max1,
+               (unsigned long)sprites_avg, (unsigned long)perf_sprites.max1,
+               (unsigned long)hud_avg,     (unsigned long)perf_hud.max1,
+               (unsigned long)clear_avg,   (unsigned long)perf_clear.max1);
+
+        /* Counter line tail: omit when all zero so a clean run stays
+         * uncluttered. Any non-zero entry means "look here first". */
+        if (perf_tic_skip || perf_audio_under || perf_dma_err || perf_spi_trip) {
+            printf(" | tic_skip=%lu audio_und=%lu dma_err=%lu spi_trip=%lu",
+                   (unsigned long)perf_tic_skip,
+                   (unsigned long)perf_audio_under,
+                   (unsigned long)perf_dma_err,
+                   (unsigned long)perf_spi_trip);
+        }
+        printf("\r\n");
+
+        perf_metric_reset(&perf_total);
+        perf_metric_reset(&perf_blit_wait);
+        perf_metric_reset(&perf_clear);
+        perf_metric_reset(&perf_bsp);
+        perf_metric_reset(&perf_paint);
+        perf_metric_reset(&perf_planes);
+        perf_metric_reset(&perf_sprites);
+        perf_metric_reset(&perf_hud);
+        perf_tic_skip = perf_audio_under = perf_dma_err = perf_spi_trip = 0;
         perf_frames = 0;
         perf_window_start_ms = now_ms;
     }

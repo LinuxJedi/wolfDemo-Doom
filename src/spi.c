@@ -1,6 +1,15 @@
 #include "stm32u585xx.h"
 #include "board.h"
 #include "spi.h"
+#include "doom_glue/perf.h"
+
+#if PERF_INSTRUMENT
+/* GPDMA error mask: data-transfer error, link-list error, user-setting
+ * error, trigger overrun. Any of these on a blit completion is a real
+ * peripheral fault (not just normal idle). */
+#define DMA_CSR_ERR_MASK (DMA_CSR_DTEF | DMA_CSR_ULEF | DMA_CSR_USEF | DMA_CSR_TOF)
+#define DMA_CFCR_ERR_MASK (DMA_CFCR_DTEF | DMA_CFCR_ULEF | DMA_CFCR_USEF | DMA_CFCR_TOF)
+#endif
 
 /*
  * Polled SPI1 driver for the ST7789 display.
@@ -130,6 +139,9 @@ static int spi_xfer_chunk(const uint8_t *data, size_t len, int repeat_value)
             if (--guard == 0) {
                 spi_last_sr = SPI1->SR;
                 SPI1->CR1 = SPI_CR1_SSI;
+#if PERF_INSTRUMENT
+                perf_spi_trip++;
+#endif
                 return -1;
             }
         }
@@ -146,6 +158,9 @@ static int spi_xfer_chunk(const uint8_t *data, size_t len, int repeat_value)
     while ((SPI1->SR & SPI_SR_TXC) == 0) {
         if (--guard == 0) {
             spi_last_sr = SPI1->SR;
+#if PERF_INSTRUMENT
+            perf_spi_trip++;
+#endif
             break;
         }
     }
@@ -308,15 +323,30 @@ void spi_dma_blit_wait(void)
     while ((ch->CSR & DMA_CSR_IDLEF) == 0) {
         if (--guard == 0) {
             spi_last_sr = SPI1->SR;
+#if PERF_INSTRUMENT
+            perf_spi_trip++;
+#endif
             break;
         }
     }
+
+#if PERF_INSTRUMENT
+    if (ch->CSR & DMA_CSR_ERR_MASK) {
+        perf_dma_err++;
+    }
+#endif
 
     /* Then wait for SPI to finish shifting the last byte out the wire
      * - DMA done only means bytes are in the SPI FIFO. */
     guard = 200000u;
     while ((SPI1->SR & SPI_SR_TXC) == 0) {
-        if (--guard == 0) { spi_last_sr = SPI1->SR; break; }
+        if (--guard == 0) {
+            spi_last_sr = SPI1->SR;
+#if PERF_INSTRUMENT
+            perf_spi_trip++;
+#endif
+            break;
+        }
     }
 
     /* Drop SPE FIRST. STM32U5 SPI locks DSIZE (and most CFG1 bits)
@@ -428,6 +458,9 @@ void spi_blit_async_wait(void)
     while (async_state == ASYNC_INFLIGHT) {
         if (--guard == 0) {
             spi_last_sr = SPI1->SR;
+#if PERF_INSTRUMENT
+            perf_spi_trip++;
+#endif
             break;
         }
     }
@@ -442,7 +475,13 @@ void spi_blit_async_wait(void)
      * goes via the regular spi_xfer_chunk path cleanly. */
     guard = 200000u;
     while ((SPI1->SR & SPI_SR_TXC) == 0) {
-        if (--guard == 0) { spi_last_sr = SPI1->SR; break; }
+        if (--guard == 0) {
+            spi_last_sr = SPI1->SR;
+#if PERF_INSTRUMENT
+            perf_spi_trip++;
+#endif
+            break;
+        }
     }
     /* Drop SPE FIRST. STM32U5 SPI locks DSIZE (and most CFG1 bits)
      * while SPE=1, so the DSIZE=7 restore must happen afterwards. */
@@ -469,6 +508,15 @@ int spi_blit_async_busy(void)
 void GPDMA1_Channel0_IRQHandler(void)
 {
     DMA_Channel_TypeDef *ch = GPDMA1_Channel0;
+#if PERF_INSTRUMENT
+    /* Snapshot CSR before clearing; per-chunk error counter for the
+     * silent-failure surface. Clear the error bits too so they don't
+     * pile up across chunks. */
+    if (ch->CSR & DMA_CSR_ERR_MASK) {
+        perf_dma_err++;
+        ch->CFCR = DMA_CFCR_ERR_MASK;
+    }
+#endif
     /* W1C: write the bits to clear them. Clearing only TCF leaves any
      * concurrent error flag visible. */
     ch->CFCR = DMA_CFCR_TCF;
