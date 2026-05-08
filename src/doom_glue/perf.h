@@ -4,8 +4,8 @@
 #include <stdint.h>
 #include "stm32u585xx.h"
 
-/* Set to 0 to compile out all instrumentation. */
-#define PERF_INSTRUMENT 1
+/* Set to 1 to enable [perf] line emission and all subsystem brackets. */
+#define PERF_INSTRUMENT 0
 
 /* Enable the M33 DWT cycle counter. Call once at startup after SYSCLK
  * is at its final rate; perf_us_since assumes 160 MHz. */
