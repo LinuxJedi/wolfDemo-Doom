@@ -91,6 +91,18 @@ LoopFillZerobss:
 	cmp	r2, r3
 	bcc	FillZerobss
 
+/* Zero fill the .sram4 (NOLOAD) section so static __attribute__((section(".sram4")))
+ * variables get the C-mandated zero init before any code runs. */
+	ldr	r2, =_ssram4
+	b	LoopFillZeroSram4
+FillZeroSram4:
+	movs	r3, #0
+	str	r3, [r2], #4
+LoopFillZeroSram4:
+	ldr	r3, =_esram4
+	cmp	r2, r3
+	bcc	FillZeroSram4
+
 /* Call static constructors */
     bl __libc_init_array
 /* Call the application's entry point.*/

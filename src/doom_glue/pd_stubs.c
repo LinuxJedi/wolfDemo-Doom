@@ -570,7 +570,7 @@ static void paint_textured_column(uint8_t fallback_colour)
 static int     sky_cache_patch = -1;
 static int     sky_cache_width;
 static uint8_t sky_cache_data[SKY_CACHE_MAX_COLS][WHD_TEXTURE_COL_HEIGHT];
-static uint8_t sky_cache_valid[SKY_CACHE_MAX_COLS];
+static uint8_t sky_cache_valid[SKY_CACHE_MAX_COLS] __attribute__((section(".sram4")));
 
 static void paint_sky_column(void)
 {
@@ -1054,108 +1054,124 @@ static const uint8_t *load_flat(int picnum)
     return flat_cache[slot];
 }
 
-/* Plane lighting cache. R_MapPlane lighting is `level = clamp(startmap
- * - (SCREENWIDTH/4)/(zindex+1), 0, NUMCOLORMAPS-1)` with `zindex =
- * (plane_h * yslope[y]) >> LIGHTZSHIFT`. For a given visplane both
- * `startmap` (from lightlevel + extralight) and `plane_h` are constant,
- * so the entire `level[y]` profile depends only on the visplane index
- * for the current frame. Caching it avoids the per-pixel divide that
- * NO_USE_ZLIGHT forces inline; one cache slot is sufficient because
- * pd_add_plane_column calls cluster by fd_num within R_DrawPlanes.
+/* Plane lighting profile. `level[y] = clamp(startmap -
+ * (SCREENWIDTH/4)/(zindex+1), 0, NUMCOLORMAPS-1)` with zindex =
+ * (plane_h * yslope[y]) >> LIGHTZSHIFT. startmap and plane_h are
+ * per-visplane constants, so the entire level[y] table is. We
+ * recompute it on the first access for a visplane (either from
+ * pd_finalize_planes or from the overlap fallback) and reuse it
+ * across every span / column emitted for that same visplane.
  *
- * yslope[] is sized MAIN_VIEWHEIGHT (168) under DOOM_TINY, not full
- * SCREENHEIGHT - the bottom 32 rows are the status bar and never
- * receive plane columns. Sizing the cache to MAIN_VIEWHEIGHT keeps
- * indexing in bounds; pd_add_plane_column never gets a yh past the
- * view region in practice.
- *
- * Invalidated each frame in pd_begin_frame: fd_num is reused across
- * frames for a different visplane, so the cached profile would be
- * stale. */
+ * The cache is a single slot keyed by fd_num because both the BSP-walk
+ * column emissions and the finalize span emissions cluster by fd_num.
+ * Reset to -1 in pd_begin_frame so frame-to-frame fd_num reuse can't
+ * serve stale data. yslope[] is sized MAIN_VIEWHEIGHT (168) under
+ * DOOM_TINY; status-bar rows never receive plane spans. */
 static int     plane_light_cached_fd = -1;
-static uint8_t plane_light_level[MAIN_VIEWHEIGHT];
+static uint8_t plane_light_level[MAIN_VIEWHEIGHT] __attribute__((section(".sram4")));
 
-/* Per-column cache of cos(angle(x)) * distscale(x) and
- * sin(angle(x)) * distscale(x). These depend only on viewangle and
- * x, both frame-constant, so the same value is reused across every
- * visplane (typically floor + ceiling, sometimes more) that touches
- * column x. Filled lazily on first access; the validity bitmap is
- * cleared in pd_begin_frame.
- *
- * Storage: 320 * (4 + 4 + 1) = 2880 B BSS. */
-static fixed_t plane_xcos[DOOM_W];
-static fixed_t plane_xsin[DOOM_W];
-static uint8_t plane_xcache_valid[DOOM_W];
-
-void pd_add_plane_column(int x, int yl, int yh, fixed_t scale,
-                         int floor, int fd_num)
+static void plane_light_refresh(int fd_num, fixed_t plane_h)
 {
-    (void)scale;
+    if (fd_num == plane_light_cached_fd) return;
+    int light = (visplanes[fd_num].lightlevel >> LIGHTSEGSHIFT) + extralight;
+    if (light < 0)             light = 0;
+    if (light >= LIGHTLEVELS)  light = LIGHTLEVELS - 1;
+    int startmap = ((LIGHTLEVELS - 1 - light) * 2) * NUMCOLORMAPS / LIGHTLEVELS;
+    for (int yy = 0; yy < MAIN_VIEWHEIGHT; yy++) {
+        fixed_t distance = FixedMul(plane_h, yslope[yy]);
+        unsigned zindex  = (unsigned)distance >> LIGHTZSHIFT;
+        int scale_l      = (SCREENWIDTH / 4) / (int)(zindex + 1);
+        int level        = startmap - scale_l;
+        if (level < 0)             level = 0;
+        if (level >= NUMCOLORMAPS) level = NUMCOLORMAPS - 1;
+        plane_light_level[yy] = (uint8_t)level;
+    }
+    plane_light_cached_fd = fd_num;
+}
 
-    if (yl > yh) return;
-    if (yl < 0) yl = 0;
-    /* Cap to MAIN_VIEWHEIGHT - 1 so the per-pixel `yslope[y]` access
-     * stays in bounds. Plane columns never need to reach into the
-     * status bar region (rows 168..199); the engine emits ceiling /
-     * floor spans only across the view area. */
-    if (yh > MAIN_VIEWHEIGHT - 1) yh = MAIN_VIEWHEIGHT - 1;
-    if (x < 0 || x >= DOOM_W) return;
-    /* Same x % 4 == 3 drop as pd_add_column - the SPI converter never
-     * ships these columns to the panel, so the per-pixel projection
-     * + flat sample work is pure waste. Plane spans dominate the
-     * frame budget on open-area scenes, so this is the biggest single
-     * column-skip win. */
-    if ((x & 3) == 3) return;
+/* Plane buffering for span-major draw. pd_add_plane_column is called
+ * column-by-column from r_segs.c during BSP traversal; rather than
+ * rasterise each column with two FixedMul-per-pixel (the classic
+ * column-major R_MapPlane), we record the (top, bot) row range per
+ * (visplane, x) here and walk it as horizontal spans in
+ * pd_finalize_planes. Along a span (constant y) the world-space
+ * delta per pixel is constant, so the inner loop drops to two
+ * adds + one flat sample + one LUT lookup per pixel - roughly 2.5x
+ * the column-major cost on Cortex-M33.
+ *
+ * Storage: 128 visplanes * 320 columns * 2 bytes (top + bot) = 80 KB
+ * main BSS, plus ~768 B of per-visplane bookkeeping in SRAM4. The
+ * sentinel for "column not touched" is plane_top[x] = 0xff; bot is
+ * undefined for untouched columns and is never read.
+ *
+ * fd_num is bounded by MAXVISPLANES (128) and clamped on entry to
+ * pd_add_plane_column. The visplane layer hands out indices densely
+ * from 0 within a frame (R_ClearPlanes resets lastvisplane). */
+/* Sentinels in plane_top[]:
+ *   PD_PLANE_UNTOUCHED (0xff) - column not emitted this frame.
+ *   PD_PLANE_INLINE_DRAWN (0xfe) - both emissions for this column were
+ *     painted column-major in BSP order (overlap fallback). Treated as
+ *     untouched by the makespans walker so no span paints over them.
+ * Real top values are in [0, MAIN_VIEWHEIGHT - 1] = [0, 167], so 0xfe
+ * and 0xff cannot collide with a legitimate value. */
+#define PD_PLANE_UNTOUCHED    0xff
+#define PD_PLANE_INLINE_DRAWN 0xfe
+static uint8_t plane_top[MAXVISPLANES][DOOM_W];
+static uint8_t plane_bot[MAXVISPLANES][DOOM_W];
 
-    if (fd_num < 0 || fd_num >= MAXVISPLANES) return;
+/* Per-frame visplane bookkeeping, sized for MAXVISPLANES = 128 entries.
+ * plane_used_list keeps fd_nums in touch order so finalize iterates
+ * only over touched visplanes (typically << 128). plane_used_bit makes
+ * the dedup check O(1) on insert. */
+static int16_t plane_minx[MAXVISPLANES] __attribute__((section(".sram4")));
+static int16_t plane_maxx[MAXVISPLANES] __attribute__((section(".sram4")));
+static uint8_t plane_used_bit[MAXVISPLANES] __attribute__((section(".sram4")));
+static uint8_t plane_used_list[MAXVISPLANES] __attribute__((section(".sram4")));
+static int     plane_used_count;
+
+/* spanstart[y] - x where the currently-open span at row y began. Reused
+ * across visplanes since every open span is closed before the next
+ * visplane starts. */
+static uint16_t plane_spanstart[MAIN_VIEWHEIGHT] __attribute__((section(".sram4")));
+
+/* Per-column cos(angle(x)) * distscale(x) and sin(angle(x)) * distscale(x).
+ * Frame-constant (depend only on viewangle and x); shared across every
+ * visplane that touches column x via the overlap-fallback path. The
+ * span drawer uses the basexscale / baseyscale form instead so it
+ * doesn't read this cache, but on heavy zig-zag geometry many overlap
+ * fallbacks land on the same x with different fd_nums, where caching
+ * the per-x trig pays off. Filled lazily; valid bitmap cleared in
+ * pd_begin_frame. ~2.9 KB in SRAM4. */
+static fixed_t plane_xcos[DOOM_W] __attribute__((section(".sram4")));
+static fixed_t plane_xsin[DOOM_W] __attribute__((section(".sram4")));
+static uint8_t plane_xcache_valid[DOOM_W] __attribute__((section(".sram4")));
+
+/* Self-contained column-major fallback for the rare overlap case in
+ * pd_add_plane_column (see comment there). No global caches: lighting,
+ * cos/sin/dscale, and flat are all derived per call. Slow per pixel
+ * vs. the span drawer, but only fires when the engine reuses a visplane
+ * for two stacked emissions at the same x - typically a handful of
+ * columns per frame in zig-zag floor geometry. */
+static void paint_plane_column_immediate(int x, int yl, int yh, int fd_num)
+{
     int picnum = visplanes[fd_num].picnum;
-
-    /* Sky flat: keep flat-colour stripe; sky needs the texture column
-     * path which isn't wired yet. */
     if (picnum == skyflatnum) {
         paint_column(x, yl, yh, COLOUR_SKY);
         return;
     }
-    /* Animated/translated flats (NUKAGE, FWATER, etc.) live in a small
-     * indirection table - same logic as pd_render.cpp:translate_picnum. */
     if (whd_flattospecial[picnum] != 0xff) {
         picnum = whd_specialtoflat[whd_flattranslation[whd_flattospecial[picnum]]];
     }
-
     const uint8_t *flat = load_flat(picnum);
     if (!flat) {
-        paint_column(x, yl, yh, floor ? COLOUR_FLOOR : COLOUR_CEILING);
+        paint_column(x, yl, yh,
+                     (visplanes[fd_num].height < viewz) ? COLOUR_FLOOR : COLOUR_CEILING);
         return;
     }
 
     fixed_t plane_h = abs(visplanes[fd_num].height - viewz);
+    plane_light_refresh(fd_num, plane_h);
 
-    /* Refresh the lighting profile when we hit a new visplane. */
-    if (fd_num != plane_light_cached_fd) {
-        int light = (visplanes[fd_num].lightlevel >> LIGHTSEGSHIFT) + extralight;
-        if (light < 0)             light = 0;
-        if (light >= LIGHTLEVELS)  light = LIGHTLEVELS - 1;
-        int startmap = ((LIGHTLEVELS - 1 - light) * 2) * NUMCOLORMAPS / LIGHTLEVELS;
-        for (int yy = 0; yy < MAIN_VIEWHEIGHT; yy++) {
-            fixed_t distance = FixedMul(plane_h, yslope[yy]);
-            unsigned zindex  = (unsigned)distance >> LIGHTZSHIFT;
-            int scale_l      = (SCREENWIDTH / 4) / (int)(zindex + 1);
-            int level        = startmap - scale_l;
-            if (level < 0)             level = 0;
-            if (level >= NUMCOLORMAPS) level = NUMCOLORMAPS - 1;
-            plane_light_level[yy] = (uint8_t)level;
-        }
-        plane_light_cached_fd = fd_num;
-    }
-
-    /* Hoist the column-constant Kx, Ky out of the per-pixel loop:
-     *   length    = plane_h * dscale * yslope[y]    (per pixel)
-     *   world_x   = viewx + cos_a * length          = viewx + Kx * yslope[y]
-     *   world_y   = -viewy - sin_a * length         = -viewy - Ky * yslope[y]
-     * with Kx = cos_a * plane_h * dscale, Ky = sin_a * plane_h * dscale.
-     * cos_a*dscale and sin_a*dscale depend only on viewangle and x, so
-     * they're shared across every visplane that touches this column;
-     * cache them per frame and only multiply by plane_h here. */
     if (!plane_xcache_valid[x]) {
         angle_t angle  = (viewangle + x_to_viewangle(x)) >> ANGLETOFINESHIFT;
         fixed_t cos_a  = finecosine(angle);
@@ -1178,6 +1194,246 @@ void pd_add_plane_column(int x, int yl, int yh, fixed_t scale,
         *dest = clut[flat[(v << 6) | u]];
         dest += DISP_W;
     }
+}
+
+void pd_add_plane_column(int x, int yl, int yh, fixed_t scale,
+                         int floor, int fd_num)
+{
+    (void)scale;
+    (void)floor;
+
+    if (yl > yh) return;
+    if (yl < 0) yl = 0;
+    /* Cap to MAIN_VIEWHEIGHT - 1 so the per-row `yslope[y]` access in
+     * pd_finalize_planes stays in bounds. Plane columns never need to
+     * reach into the status bar region (rows 168..199); the engine
+     * emits ceiling / floor spans only across the view area. */
+    if (yh > MAIN_VIEWHEIGHT - 1) yh = MAIN_VIEWHEIGHT - 1;
+    if (x < 0 || x >= DOOM_W) return;
+    /* Same x % 4 == 3 drop as pd_add_column - the SPI converter never
+     * ships these columns to the panel, so the per-pixel projection
+     * + flat sample work is pure waste. */
+    if ((x & 3) == 3) return;
+
+    if (fd_num < 0 || fd_num >= MAXVISPLANES) return;
+    int picnum = visplanes[fd_num].picnum;
+
+    /* Sky flat: paint immediately as a colour stripe. Sky doesn't go
+     * through the span drawer (no flat sampling); also lets us skip
+     * adding sky visplanes to the touch list. */
+    if (picnum == skyflatnum) {
+        paint_column(x, yl, yh, COLOUR_SKY);
+        return;
+    }
+
+    /* Overlap case: under NO_VISPLANE_GUTS=1 the engine has no
+     * R_CheckPlane to split a visplane when its silhouette overlaps,
+     * so two stacked wall segments sharing (height, picnum, light)
+     * can both emit at the same x for the same fd_num. With the
+     * column-major path each call painted directly in BSP order and
+     * later emissions overdrew earlier ones in any overlapping pixel;
+     * here we'd lose the buffered one. Reproduce the old behaviour:
+     * paint BOTH the buffered range and the new one column-major,
+     * then mark the column INLINE_DRAWN so the makespans walk skips
+     * it (preventing spans painting over the inline pixels). */
+    uint8_t prev_top = plane_top[fd_num][x];
+    if (prev_top != PD_PLANE_UNTOUCHED) {
+        if (prev_top != PD_PLANE_INLINE_DRAWN) {
+            /* First overlap: also flush the previously-buffered range
+             * inline so paint order matches the column-major code path
+             * (buffered emission drawn first, then this one on top). */
+            paint_plane_column_immediate(x, prev_top, plane_bot[fd_num][x], fd_num);
+        }
+        paint_plane_column_immediate(x, yl, yh, fd_num);
+        plane_top[fd_num][x] = PD_PLANE_INLINE_DRAWN;
+        return;
+    }
+
+    /* First emission for this (fd, x): buffer the row range. Defer all
+     * of flat load, animation translation, lighting profile, and
+     * per-pixel sampling to pd_finalize_planes which can hoist them
+     * per-span / per-visplane instead of paying per-column. */
+    plane_top[fd_num][x] = (uint8_t)yl;
+    plane_bot[fd_num][x] = (uint8_t)yh;
+    if (!plane_used_bit[fd_num]) {
+        plane_used_bit[fd_num] = 1;
+        plane_used_list[plane_used_count++] = (uint8_t)fd_num;
+        plane_minx[fd_num] = (int16_t)x;
+        plane_maxx[fd_num] = (int16_t)x;
+    } else {
+        if (x < plane_minx[fd_num]) plane_minx[fd_num] = (int16_t)x;
+        if (x > plane_maxx[fd_num]) plane_maxx[fd_num] = (int16_t)x;
+    }
+}
+
+/* Span drawer for the buffered plane path. Along a span at row y, the
+ * world-space step per x-pixel is constant: ds_xstep = distance *
+ * basexscale, ds_ystep = distance * baseyscale, with distance =
+ * plane_h * yslope[y]. So the inner loop is two adds + one flat sample
+ * + one LUT lookup, no FixedMul.
+ *
+ * 3-of-4 unroll: the (x & 3) == 3 columns are dropped at SPI conversion
+ * time. Hoisting that test out of the per-pixel loop keeps the inner
+ * body branch-free in the common 4-aligned middle of the span. */
+static void paint_flat_span(int y, int xl, int xh, fixed_t plane_h,
+                            const uint8_t *flat)
+{
+    if (xl > xh) return;
+
+    fixed_t distance = FixedMul(plane_h, yslope[y]);
+    fixed_t xstep    = FixedMul(distance, basexscale);
+    fixed_t ystep    = FixedMul(distance, baseyscale);
+    fixed_t length   = FixedMul(distance, distscale(xl));
+    angle_t angle    = (viewangle + x_to_viewangle(xl)) >> ANGLETOFINESHIFT;
+    fixed_t xfrac    = viewx  + FixedMul(finecosine(angle), length);
+    fixed_t yfrac    = -viewy - FixedMul(finesine(angle), length);
+
+    const uint16_t *clut = lit_lut[plane_light_level[y]];
+    pixel_t *dest = &I_VideoBuffer[y * DISP_W + x_squeeze(xl)];
+
+    int x = xl;
+    /* Head: align x to a 4-pixel boundary. */
+    while ((x & 3) != 0 && x <= xh) {
+        if ((x & 3) != 3) {
+            unsigned u = ((unsigned)xfrac >> FRACBITS) & 63;
+            unsigned v = ((unsigned)yfrac >> FRACBITS) & 63;
+            *dest++ = clut[flat[(v << 6) | u]];
+        }
+        xfrac += xstep; yfrac += ystep; x++;
+    }
+    /* Body: 4-pixel groups, write 3, skip 1. */
+    while (x + 3 <= xh) {
+        unsigned u, v;
+        u = ((unsigned)xfrac >> FRACBITS) & 63;
+        v = ((unsigned)yfrac >> FRACBITS) & 63;
+        *dest++ = clut[flat[(v << 6) | u]];
+        xfrac += xstep; yfrac += ystep;
+        u = ((unsigned)xfrac >> FRACBITS) & 63;
+        v = ((unsigned)yfrac >> FRACBITS) & 63;
+        *dest++ = clut[flat[(v << 6) | u]];
+        xfrac += xstep; yfrac += ystep;
+        u = ((unsigned)xfrac >> FRACBITS) & 63;
+        v = ((unsigned)yfrac >> FRACBITS) & 63;
+        *dest++ = clut[flat[(v << 6) | u]];
+        xfrac += xstep + xstep; yfrac += ystep + ystep;
+        x += 4;
+    }
+    /* Tail. */
+    while (x <= xh) {
+        if ((x & 3) != 3) {
+            unsigned u = ((unsigned)xfrac >> FRACBITS) & 63;
+            unsigned v = ((unsigned)yfrac >> FRACBITS) & 63;
+            *dest++ = clut[flat[(v << 6) | u]];
+        }
+        xfrac += xstep; yfrac += ystep; x++;
+    }
+}
+
+/* Walk the touched visplanes, convert their (top[x], bot[x]) silhouettes
+ * to horizontal spans (vanilla R_MakeSpans algorithm), and paint via
+ * paint_flat_span. Called from pd_end_frame before sprite drain so the
+ * planes appear under sprites in the framebuffer. */
+static void pd_finalize_planes(void)
+{
+    for (int idx = 0; idx < plane_used_count; idx++) {
+        int fd_num = plane_used_list[idx];
+        plane_used_bit[fd_num] = 0;
+
+        int picnum = visplanes[fd_num].picnum;
+        /* Sky was painted immediately in pd_add_plane_column. */
+        if (picnum == skyflatnum) goto cleanup_columns;
+
+        /* Animated/translated flats (NUKAGE, FWATER, etc.). */
+        if (whd_flattospecial[picnum] != 0xff) {
+            picnum = whd_specialtoflat[whd_flattranslation[whd_flattospecial[picnum]]];
+        }
+
+        const uint8_t *flat   = load_flat(picnum);
+        fixed_t        plane_h = abs(visplanes[fd_num].height - viewz);
+        uint8_t        fb_colour = (visplanes[fd_num].height < viewz)
+                                       ? COLOUR_FLOOR : COLOUR_CEILING;
+
+        plane_light_refresh(fd_num, plane_h);
+
+        int minx = plane_minx[fd_num];
+        int maxx = plane_maxx[fd_num];
+
+        /* R_MakeSpans sweep: walk x from minx to maxx+1; the +1 step
+         * forces every still-open span to close. Sentinels for an
+         * untouched column: t = MAIN_VIEWHEIGHT (> any real bot),
+         * b = -1 (< any real top), so the makespans loops fire only
+         * on real transitions. */
+        int prev_t = MAIN_VIEWHEIGHT, prev_b = -1;
+        for (int x = minx; x <= maxx + 1; x++) {
+            int orig_t, orig_b;
+            uint8_t cell = (x > maxx) ? PD_PLANE_UNTOUCHED : plane_top[fd_num][x];
+            if (cell >= PD_PLANE_INLINE_DRAWN) {
+                /* Untouched or inline-drawn: no span emission for this x. */
+                orig_t = MAIN_VIEWHEIGHT;
+                orig_b = -1;
+            } else {
+                orig_t = cell;
+                orig_b = plane_bot[fd_num][x];
+            }
+            int t = orig_t, b = orig_b;
+
+            if (flat) {
+                while (prev_t < t && prev_t <= prev_b) {
+                    paint_flat_span(prev_t, plane_spanstart[prev_t],
+                                    x - 1, plane_h, flat);
+                    prev_t++;
+                }
+                while (prev_b > b && prev_b >= prev_t) {
+                    paint_flat_span(prev_b, plane_spanstart[prev_b],
+                                    x - 1, plane_h, flat);
+                    prev_b--;
+                }
+            } else {
+                /* No flat data - paint a flat colour stripe for each
+                 * closing run. Mirrors the legacy fallback in the
+                 * column-major path. */
+                while (prev_t < t && prev_t <= prev_b) {
+                    int xl = plane_spanstart[prev_t], xh = x - 1;
+                    pixel_t pix = palette_rgb565[fb_colour];
+                    pixel_t *dst = &I_VideoBuffer[prev_t * DISP_W];
+                    for (int xx = xl; xx <= xh; xx++) {
+                        if ((xx & 3) != 3)
+                            dst[x_squeeze(xx)] = pix;
+                    }
+                    prev_t++;
+                }
+                while (prev_b > b && prev_b >= prev_t) {
+                    int xl = plane_spanstart[prev_b], xh = x - 1;
+                    pixel_t pix = palette_rgb565[fb_colour];
+                    pixel_t *dst = &I_VideoBuffer[prev_b * DISP_W];
+                    for (int xx = xl; xx <= xh; xx++) {
+                        if ((xx & 3) != 3)
+                            dst[x_squeeze(xx)] = pix;
+                    }
+                    prev_b--;
+                }
+            }
+            while (t < prev_t && t <= b) {
+                plane_spanstart[t] = (uint16_t)x;
+                t++;
+            }
+            while (b > prev_b && b >= t) {
+                plane_spanstart[b] = (uint16_t)x;
+                b--;
+            }
+            prev_t = orig_t;
+            prev_b = orig_b;
+        }
+
+cleanup_columns:
+        /* Reset the touched columns so the buffer is clean for the next
+         * frame. Walk minx..maxx only - untouched columns kept their
+         * sentinel from the previous reset. */
+        for (int x = plane_minx[fd_num]; x <= plane_maxx[fd_num]; x++) {
+            plane_top[fd_num][x] = PD_PLANE_UNTOUCHED;
+        }
+    }
+    plane_used_count = 0;
 }
 
 /* ---------- Wipe (melt) animation -------------------------------
@@ -1280,6 +1536,12 @@ void pd_begin_frame(void)
     static int patchlist_initialized = 0;
     if (!patchlist_initialized) {
         vpatchlists->framebuffer[0].header.max = VPATCHLIST_COUNT_FRAMEBUFFER;
+        /* Plane buffering uses 0xff as the "column not touched" sentinel.
+         * BSS zero-init would seed every column to 0 and confuse the span
+         * walker into reading row 0 spans for untouched columns. Prime
+         * the buffer once so the per-frame cleanup invariant
+         * (touched columns get cleared back to 0xff) holds from frame 1. */
+        memset(plane_top, PD_PLANE_UNTOUCHED, sizeof plane_top);
         patchlist_initialized = 1;
     }
 
@@ -1310,13 +1572,18 @@ void pd_begin_frame(void)
          * whole 240*200 uint16_t buffer. */
         memset(I_VideoBuffer, 0, DISP_W * DOOM_H * sizeof(pixel_t));
     }
+    /* Touched-visplane bookkeeping is reset by pd_finalize_planes when
+     * it drains the buffer; nothing to do here on the BSP-emit side. */
+
     /* Plane lighting cache is keyed on visplane index; the index is
      * reused across frames for unrelated visplanes, so drop the cache
-     * on every new frame to avoid serving stale `level[y]` profiles. */
+     * on every new frame to avoid serving stale level[y] profiles. */
     plane_light_cached_fd = -1;
+
     /* Per-column cos*dscale / sin*dscale cache depends on viewangle,
      * which can change every frame. Drop validity. */
     memset(plane_xcache_valid, 0, sizeof plane_xcache_valid);
+
     wipe_min = 0;
 }
 
@@ -1613,6 +1880,14 @@ void pd_end_frame(int wipe_start)
                 V_BeginPatchList(vpatchlists->framebuffer);
                 F_Drawer();
             }
+        }
+
+        /* Drain the buffered visplanes via the span-major drawer. Walls
+         * have already rasterised during BSP traversal; planes need to
+         * fill the silhouette below the wall sweeps. Sprites then
+         * draw on top of both. */
+        if (gamestate == GS_LEVEL) {
+            pd_finalize_planes();
         }
 
         /* Drain sprites here, after R_RenderPlayerView has emitted all

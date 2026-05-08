@@ -140,14 +140,18 @@ SECTIONS
   /*
    * Optional separate-bank scratch memory: SRAM4 is on its own AHB and is
    * great for small hot structures (e.g. column drawers' state). Anything
-   * marked __attribute__((section(".sram4"))) lands here. Leave empty for
-   * now; the engine port will populate it later.
+   * marked __attribute__((section(".sram4"))) lands here. Treated as BSS:
+   * the startup zero-fill loop clears [_ssram4, _esram4) at reset.
    */
   .sram4 (NOLOAD) :
   {
+    . = ALIGN(4);
     _sram4_start = .;
+    _ssram4 = .;
     *(.sram4)
     *(.sram4*)
+    . = ALIGN(4);
+    _esram4 = .;
     _sram4_end = .;
   } >SRAM4
 
