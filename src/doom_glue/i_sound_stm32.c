@@ -103,13 +103,17 @@
 #include "perf.h"
 
 #define AUDIO_SAMPLE_RATE   11025u
-/* HALF_SAMPLES = 1024 means each chunk covers ~93 ms of audio.
- * Larger chunks absorb music-synth runtime jitter (a busy chunk that
- * takes 60 ms to render still finishes before the buddy chunk runs
- * out). The trade-off is +93 ms of SFX latency, which is on the edge
- * of perceptible but acceptable for a Doom shareware demo where
- * gunshot timing isn't competitive. */
-#define HALF_SAMPLES        1024
+/* HALF_SAMPLES = 512 means each chunk covers ~46 ms of audio. The
+ * size is a trade between SFX latency, PendSV preemption granularity,
+ * and music-synth jitter absorption. With OPL2 active mix_chunk runs
+ * ~12 ms per chunk, leaving ~34 ms of slack before the buddy chunk
+ * runs dry - plenty under typical load. The smaller chunk halves the
+ * worst-case PendSV stall the renderer can hit (was ~25 ms when
+ * HALF=1024) which directly reduces frame-time variance on the
+ * non-audio subsystems (clear, paint, hud all get preempted by
+ * PendSV mid-bracket; smaller chunks => smaller spikes). SFX latency
+ * drops from ~93 ms to ~46 ms as a free side effect. */
+#define HALF_SAMPLES        512
 #define RING_SAMPLES        (HALF_SAMPLES * 2)
 
 #define ADPCM_BLOCK_SIZE              128
@@ -409,7 +413,7 @@ static void audio_hw_init(void)
      *   - SysTick: priority 2 (engine clock advance during music synth)
      *   - PendSV: priority 15 (lowest - music synth runs here)
      *
-     * The deferred-PendSV split keeps music synth (~25 ms per 46 ms
+     * The deferred-PendSV split keeps music synth (~12 ms per 46 ms
      * chunk after -O3 + OPL2 short-circuit) from blocking the per-
      * sample TIM6 firings or the SPI blit's GPDMA1 TC. SysTick at
      * priority 2 preempts PendSV so millis() keeps advancing during
