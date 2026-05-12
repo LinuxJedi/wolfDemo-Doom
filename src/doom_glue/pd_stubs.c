@@ -684,6 +684,7 @@ typedef struct {
     int16_t  x;
     int16_t  real_id;          /* negative = patch lump number */
     fixed_t  iscale;
+    fixed_t  scale;            /* pd_scale at enqueue, for depth sort */
     fixed_t  texturemid;
     uint8_t  col;
     int8_t   colormap_index;
@@ -798,6 +799,7 @@ void pd_add_masked_columns(uint8_t *ys, int seg_count)
     q->x                 = (int16_t)dc_x;
     q->real_id           = (int16_t)real_id;
     q->iscale            = dc_iscale;
+    q->scale             = pd_scale;
     q->texturemid        = dc_texturemid;
     q->col               = dc_source.col;
     q->colormap_index    = dc_colormap_index;
@@ -935,16 +937,67 @@ static void render_queued_column(const sprite_queued_column_t *q,
     }
 }
 
-/* Drain both queues. With NO_VISSPRITES=0 the engine's R_DrawMasked
- * sorts vissprites by scale and walks vsprsortedhead.next back-to-front
- * before the drawseg post-loop (also walked back-to-front), so columns
- * arrive in the queue already in the correct paint order - drain
- * forward. Player weapon sprites stay last so they sit on top of
- * everything else but the HUD. */
+/* Drain both queues. R_DrawMasked queues vissprite columns first
+ * (back-to-front by R_SortVisSprites) and then walks drawsegs in
+ * reverse to queue masked-midtex columns - so a midtex column lands
+ * in the queue AFTER every sprite column, even when the midtex wall
+ * is further from the camera than the sprite. A naive forward drain
+ * paints the wall over a closer sprite (lamps/imps clipped by the
+ * diagonal-stripe walls in E1M1's exit antechamber).
+ *
+ * Fix: stable-sort sprite_queue[] by `scale` ascending (lowest scale
+ * = furthest, painted first). pd_scale is captured per column in
+ * pd_add_masked_columns from the upstream globals set in
+ * R_DrawVisSprite (r_things.c:612) and R_RenderMaskedSegRange
+ * (r_segs.c:192) under PD_SCALE_SORT=1. R_SortVisSprites itself
+ * orders vissprites by ascending scale, so within equal scales the
+ * stable sort preserves the engine's left-to-right column emit
+ * order. The patch-decoder cache stays warm within each sprite
+ * because all columns of one vissprite share vis->scale and remain
+ * adjacent after sorting. Player weapon sprites stay last unsorted
+ * so they sit on top of everything else but the HUD. */
+static uint16_t sprite_queue_order[SPRITE_QUEUE_MAX_COLS];
+static uint16_t sprite_queue_scratch[SPRITE_QUEUE_MAX_COLS];
+
+static void sort_sprite_queue_by_scale(void)
+{
+    int n = sprite_queue_count;
+    for (int i = 0; i < n; i++) sprite_queue_order[i] = (uint16_t)i;
+
+    uint16_t *src = sprite_queue_order;
+    uint16_t *dst = sprite_queue_scratch;
+    for (int width = 1; width < n; width *= 2) {
+        for (int i = 0; i < n; i += 2 * width) {
+            int left = i;
+            int right = i + width;
+            int end = i + 2 * width;
+            if (right > n) right = n;
+            if (end > n) end = n;
+            int l = left, r = right, o = left;
+            while (l < right && r < end) {
+                /* Stable: take left when scales are equal. */
+                if (sprite_queue[src[r]].scale < sprite_queue[src[l]].scale) {
+                    dst[o++] = src[r++];
+                } else {
+                    dst[o++] = src[l++];
+                }
+            }
+            while (l < right) dst[o++] = src[l++];
+            while (r < end)   dst[o++] = src[r++];
+        }
+        uint16_t *tmp = src; src = dst; dst = tmp;
+    }
+    if (src != sprite_queue_order) {
+        memcpy(sprite_queue_order, src, n * sizeof(uint16_t));
+    }
+}
+
 static void drain_sprite_queues(void)
 {
+    sort_sprite_queue_by_scale();
     for (int i = 0; i < sprite_queue_count; i++) {
-        render_queued_column(&sprite_queue[i], sprite_queue_segs);
+        render_queued_column(&sprite_queue[sprite_queue_order[i]],
+                             sprite_queue_segs);
     }
     for (int i = 0; i < psprite_queue_count; i++) {
         render_queued_column(&psprite_queue[i], psprite_queue_segs);
