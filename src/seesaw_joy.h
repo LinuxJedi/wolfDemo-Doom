@@ -22,10 +22,22 @@
  *   Y1 < centre - DEADZONE  -> QWSTPAD_BTN_D     (back)
  *   X1 > centre + DEADZONE  -> QWSTPAD_BTN_L     (turn left)
  *   X1 < centre - DEADZONE  -> QWSTPAD_BTN_R     (turn right)
- *   B1 (seesaw GPIO 3)      -> QWSTPAD_BTN_A     (fire)
+ *   B1 (seesaw GPIO 3)      -> QWSTPAD_BTN_A     (fire / menu confirm)
  *   B2 (seesaw GPIO 13)     -> QWSTPAD_BTN_B     (use)
- *   B3 (seesaw GPIO 2)      -> QWSTPAD_BTN_PLUS  (menu enter)
- *   B4 (seesaw GPIO 14)     -> QWSTPAD_BTN_MINUS (menu escape)
+ *   B3 (seesaw GPIO 2)      -> QWSTPAD_BTN_X     (strafe modifier)
+ *   B4 (seesaw GPIO 14)     -> QWSTPAD_BTN_MINUS (menu / back out)
+ *
+ * On a Gravis Gamepad Pro (or any classic PC pad with a mode switch),
+ * set the pad to mode 2 so all four gameport button lines carry data;
+ * in legacy 2-button mode B3/B4 read as idle. The 10-button GRiP mode
+ * is not decodable through the seesaw because the protocol clocks at
+ * 20-25 kHz, well above what I2C polling can sample.
+ *
+ * B1 doubles as the menu-confirm button: the input glue in
+ * i_input_stm32.c watches Doom's `menuactive` and translates a B1 press
+ * to KEY_ENTER while a menu is open. Run is handled by Doom's autorun
+ * (joybspeed >= MAX_JOY_BUTTONS), not a button, so all four lines stay
+ * available for fire/use/strafe/back.
  */
 
 int      seesaw_joy_probe(void);         /* 0 if HW_ID looks like a seesaw chip, -1 otherwise */

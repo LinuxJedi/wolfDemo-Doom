@@ -40,10 +40,15 @@ static inline int seesaw_hwid_ok(uint8_t id)
     return id == 0x55u || (id >= 0x84u && id <= 0x87u);
 }
 
-/* Joystick wiring on the adapter (per Adafruit's PC_Joystick example). */
+/* Joystick wiring on the adapter (per Adafruit's PC_Joystick example).
+ * Note B3/B4 only carry data on pads that drive all four gameport button
+ * lines (BA1/BA2/BB1/BB2). A Gravis Gamepad Pro in legacy 2-button mode
+ * leaves B3/B4 idle; flip the pad's mode switch to position 2 to get
+ * four independent buttons. GRiP mode (position 3) cannot be decoded
+ * through the seesaw because its 20-25 kHz clock outpaces I2C polling. */
 #define SS_PIN_B1   3u   /* fire   */
 #define SS_PIN_B2   13u  /* use    */
-#define SS_PIN_B3   2u   /* enter  */
+#define SS_PIN_B3   2u   /* strafe */
 #define SS_PIN_B4   14u  /* escape */
 #define SS_ADC_X1   1u
 #define SS_ADC_Y1   15u
@@ -205,7 +210,7 @@ uint16_t seesaw_joy_read_buttons(void)
     uint32_t pressed = (~gpio_state) & SS_BTN_MASK;
     if (pressed & (1u << SS_PIN_B1)) bitmap |= (1u << QWSTPAD_BTN_A);
     if (pressed & (1u << SS_PIN_B2)) bitmap |= (1u << QWSTPAD_BTN_B);
-    if (pressed & (1u << SS_PIN_B3)) bitmap |= (1u << QWSTPAD_BTN_PLUS);
+    if (pressed & (1u << SS_PIN_B3)) bitmap |= (1u << QWSTPAD_BTN_X);
     if (pressed & (1u << SS_PIN_B4)) bitmap |= (1u << QWSTPAD_BTN_MINUS);
 
     /* Axes: convert analog 0..1023 to digital direction bits relative to

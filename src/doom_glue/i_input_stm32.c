@@ -37,6 +37,18 @@
 #include "d_event.h"
 #include "doomkeys.h"
 
+/* Doom internals we drive directly:
+ *  - menuactive: file-scope global in doom/src/doom/m_menu.c, no header
+ *    extern. We watch it so a B1 press emits KEY_ENTER while the menu is
+ *    up and KEY_RCTRL (fire) otherwise; the seesaw and QwSTPad both
+ *    surface "primary action" as QWSTPAD_BTN_A.
+ *  - joybspeed: declared in m_controls.h. Setting it >= MAX_JOY_BUTTONS
+ *    flips Doom into always-run (see g_game.c, the joybspeed >= 32 check
+ *    on the joystick speed key), which frees the pad's fourth button to
+ *    do something other than RSHIFT/run. */
+extern boolean menuactive;
+extern int     joybspeed;
+
 extern bool show_fps;
 extern void I_EnableMusic(int enable);
 
@@ -136,6 +148,19 @@ static void pad_tick(void)
     pad_init();
 
     uint16_t cur = pad_read();
+
+    /* B1 is the pad's "primary action" button (QWSTPAD_BTN_A) and we want
+     * it to fire in-game (KEY_RCTRL) but confirm in the menu (KEY_ENTER).
+     * The keymap binds A->RCTRL and PLUS->ENTER, so while menuactive is
+     * set we transpose the bit. If menuactive flips while the button is
+     * held the natural xor below sees both bits toggling, which emits a
+     * clean release of the old key and a press of the new one - exactly
+     * the behaviour we want, no extra bookkeeping required. */
+    if (menuactive && (cur & (1u << QWSTPAD_BTN_A))) {
+        cur = (uint16_t)((cur & ~(1u << QWSTPAD_BTN_A))
+                          | (1u << QWSTPAD_BTN_PLUS));
+    }
+
     uint16_t changed = cur ^ pad_prev_state;
     if (changed == 0) return;
 
@@ -182,7 +207,15 @@ void button_tick(void)
     pad_tick();
 }
 
-void I_InitInput(void)         { btn_init(); pad_init(); }
+void I_InitInput(void)
+{
+    btn_init();
+    pad_init();
+    /* Always-run: any value >= MAX_JOY_BUTTONS (32) makes the engine treat
+     * "no joystick speed button" as "speed button always pressed". Frees
+     * the pad's fourth button for menu/back instead of RSHIFT. */
+    joybspeed = 32;
+}
 void I_ShutdownInput(void)     { }
 void I_StartTextInput(int x1, int y1, int x2, int y2) {
     (void)x1; (void)y1; (void)x2; (void)y2;
