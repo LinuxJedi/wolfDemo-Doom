@@ -69,6 +69,9 @@
 /* Pimoroni QwSTPad (TCA9555 I/O expander). 7-bit I2C address. */
 #define QWSTPAD_I2C_ADDR        0x21u
 
+/* Adafruit PC Joystick to seesaw I2C Adapter (product 5753, ATtiny8x7). */
+#define SEESAW_I2C_ADDR         0x49u
+
 /* ---- System clock target after PLL ----
  * 160 MHz at VOS Range 1 with EPOD booster, matching the wolfDemo
  * blinky example. PLL: HSE 8 MHz / M=1 * N=20 / R=1 = 160 MHz. */

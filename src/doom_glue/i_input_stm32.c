@@ -32,6 +32,7 @@
 #include "stm32u585xx.h"
 #include "../board.h"
 #include "../qwstpad.h"
+#include "../seesaw_joy.h"
 
 #include "d_event.h"
 #include "doomkeys.h"
@@ -71,13 +72,16 @@ static void btn_init(void)
 }
 
 /*
- * QwSTPad bit -> Doom keycode. Mapping mirrors Heretic-era defaults
- * in m_controls.c so the engine sees keys it already binds to game
+ * Pad-bit -> Doom keycode. Mapping mirrors Heretic-era defaults in
+ * m_controls.c so the engine sees keys it already binds to game
  * actions (fire = RCTRL, use = SPACE, strafe = RALT, run = RSHIFT,
  * arrows = move/turn). + and - drive ENTER/ESC for menu navigation.
  *
  * Index = QwSTPad pin number (0x0..0xF). Slots that don't correspond
- * to a button are 0 and the polling loop skips them.
+ * to a button are 0 and the polling loop skips them. The Adafruit
+ * seesaw joystick driver reports its state in this same bit layout
+ * (axes converted to U/D/L/R, B1..B4 mapped to A/B/PLUS/MINUS), so a
+ * single keymap serves both supported controllers.
  */
 static const uint8_t pad_keymap[16] = {
     [QWSTPAD_BTN_U]     = KEY_UPARROW,
@@ -92,21 +96,46 @@ static const uint8_t pad_keymap[16] = {
     [QWSTPAD_BTN_MINUS] = KEY_ESCAPE,
 };
 
+/*
+ * Two controllers are supported on the same Qwiic / STEMMA-QT bus:
+ *
+ *   PAD_QWSTPAD  Pimoroni QwSTPad,            TCA9555 at I2C 0x21
+ *   PAD_SEESAW   Adafruit PC-joystick adapter, ATtiny8x7 seesaw at 0x49
+ *
+ * Different I2C addresses make detection unambiguous: probe seesaw via
+ * its STATUS_HW_ID register first; if that responds with a recognised
+ * silicon ID, use the seesaw driver. Otherwise try the QwSTPad init.
+ * If neither answers, leave the kind unset so the next tick re-probes
+ * (preserves the existing hot-plug retry behaviour).
+ */
+enum pad_kind { PAD_NONE = 0, PAD_QWSTPAD, PAD_SEESAW };
+static uint8_t pad_kind;
+
 static void pad_init(void)
 {
-    static int initialized;
-    if (initialized) return;
-    /* Try once. If the pad is unplugged, qwstpad_init() returns -1;
-     * leave `initialized` clear so the next button_tick() retries
-     * (lets a hot-plug eventually take effect). */
-    if (qwstpad_init() == 0) initialized = 1;
+    if (pad_kind != PAD_NONE) return;
+
+    if (seesaw_joy_probe() == 0) {
+        if (seesaw_joy_init() == 0) { pad_kind = PAD_SEESAW; return; }
+    }
+    if (qwstpad_init() == 0) { pad_kind = PAD_QWSTPAD; return; }
+    /* Neither detected - retry on the next tick. */
+}
+
+static uint16_t pad_read(void)
+{
+    switch (pad_kind) {
+        case PAD_QWSTPAD: return qwstpad_read_buttons();
+        case PAD_SEESAW:  return seesaw_joy_read_buttons();
+        default:          return 0;
+    }
 }
 
 static void pad_tick(void)
 {
     pad_init();
 
-    uint16_t cur = qwstpad_read_buttons();
+    uint16_t cur = pad_read();
     uint16_t changed = cur ^ pad_prev_state;
     if (changed == 0) return;
 

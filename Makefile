@@ -23,6 +23,7 @@ C_SRCS := \
     src/spi.c \
     src/i2c.c \
     src/qwstpad.c \
+    src/seesaw_joy.c \
     src/st7789.c \
     src/syscalls.c \
     src/system_stm32u5xx.c \
