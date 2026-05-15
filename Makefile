@@ -40,41 +40,27 @@ C_SRCS := \
 # build link errors converge.
 DOOM_SRCS := \
     doom/src/m_misc.c \
-    doom/src/m_argv.c \
     doom/src/m_bbox.c \
     doom/src/m_fixed.c \
-    doom/src/sha1.c \
     doom/src/tables.c \
     doom/src/z_zone.c \
-    doom/src/memio.c \
     doom/src/w_file.c \
     doom/src/w_file_memory.c \
     doom/src/w_wad.c \
-    doom/src/w_main.c \
-    doom/src/w_checksum.c \
-    doom/src/w_merge.c \
     doom/src/tiny_huff.c \
     doom/src/image_decoder.c \
     doom/src/musx_decoder.c \
-    doom/src/aes_prng.c \
     doom/src/d_event.c \
     doom/src/d_iwad.c \
     doom/src/d_loop.c \
-    doom/src/d_mode.c \
-    doom/src/deh_str.c \
-    doom/src/gusconf.c \
     doom/src/midifile.c \
-    doom/src/mus2mid.c \
     doom/src/m_cheat.c \
-    doom/src/m_config.c \
     doom/src/m_controls.c \
-    doom/src/v_diskicon.c \
     doom/src/v_video.c \
     doom/src/doom/am_map.c \
     doom/src/doom/d_items.c \
     doom/src/doom/d_main.c \
     doom/src/doom/d_net.c \
-    doom/src/doom/doomdef.c \
     doom/src/doom/doomstat.c \
     doom/src/doom/dstrings.c \
     doom/src/doom/f_finale.c \
@@ -96,7 +82,6 @@ DOOM_SRCS := \
     doom/src/doom/p_mobj.c \
     doom/src/doom/p_plats.c \
     doom/src/doom/p_pspr.c \
-    doom/src/doom/p_saveg.c \
     doom/src/doom/p_setup.c \
     doom/src/doom/p_sight.c \
     doom/src/doom/p_spec.c \
@@ -105,7 +90,6 @@ DOOM_SRCS := \
     doom/src/doom/p_tick.c \
     doom/src/doom/p_user.c \
     doom/src/doom/r_bsp.c \
-    doom/src/doom/r_data.c \
     doom/src/doom/r_data_whd.c \
     doom/src/doom/r_draw.c \
     doom/src/doom/r_main.c \
