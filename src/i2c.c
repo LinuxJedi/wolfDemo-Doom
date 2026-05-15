@@ -18,13 +18,42 @@
  *
  * Each public entry point uses a bounded software guard so a stuck
  * line (e.g. an unplugged QwSTPad) returns -1 instead of hanging the
- * render loop. The guard is sized for ~10 ms at 160 MHz; well above a
- * worst-case byte time at 100 kHz (~90 us per byte) but short enough
- * that a missing device costs less than one frame.
+ * render loop. The guard is sized above a worst-case byte time at
+ * 100 kHz (~90 us per byte), but failed devices are retried with
+ * higher-level backoff in i_input_stm32.c.
  */
 
 #define I2C_TIMINGR_100K_160MHZ  0xF0423131u
-#define I2C_GUARD                1600000u
+#define I2C_GUARD                240000u
+
+static void clear_error_state(void)
+{
+    I2C1->ICR = I2C_ICR_ADDRCF
+              | I2C_ICR_ALERTCF
+              | I2C_ICR_ARLOCF
+              | I2C_ICR_BERRCF
+              | I2C_ICR_NACKCF
+              | I2C_ICR_OVRCF
+              | I2C_ICR_PECCF
+              | I2C_ICR_STOPCF
+              | I2C_ICR_TIMOUTCF;
+    I2C1->CR2 = 0;
+}
+
+static void recover_after_error(void)
+{
+    clear_error_state();
+
+    /* If the peripheral still thinks the bus is busy after a timed-out
+     * fragment, toggle PE to drop the internal I2C state machine. This
+     * does not fix an externally held-low line, but it avoids making the
+     * next retry inherit a stale START/NBYTES state. */
+    if (I2C1->ISR & I2C_ISR_BUSY) {
+        I2C1->CR1 &= ~I2C_CR1_PE;
+        I2C1->CR1 |= I2C_CR1_PE;
+        clear_error_state();
+    }
+}
 
 static int wait_flag(volatile uint32_t *isr, uint32_t mask)
 {
@@ -89,19 +118,30 @@ void i2c_init(void)
 
 /* Program CR2 for one logical transfer fragment. AUTOEND controls
  * whether STOP is generated automatically after NBYTES bytes. */
-static void start_xfer(uint8_t addr7, size_t nbytes, int rd, int autoend)
+static int start_xfer(uint8_t addr7, size_t nbytes, int rd, int autoend,
+                      int repeated_start)
 {
+    if (!repeated_start && (I2C1->ISR & I2C_ISR_BUSY)) {
+        recover_after_error();
+        if (I2C1->ISR & I2C_ISR_BUSY) return -1;
+    }
+    clear_error_state();
+
     uint32_t cr2 = ((uint32_t)addr7 << 1)
                  | ((uint32_t)nbytes << I2C_CR2_NBYTES_Pos)
                  | I2C_CR2_START;
     if (rd)      cr2 |= I2C_CR2_RD_WRN;
     if (autoend) cr2 |= I2C_CR2_AUTOEND;
     I2C1->CR2 = cr2;
+    return 0;
 }
 
 static int wait_stop_clear(void)
 {
-    if (wait_flag(&I2C1->ISR, I2C_ISR_STOPF) != 0) return -1;
+    if (wait_flag(&I2C1->ISR, I2C_ISR_STOPF) != 0) {
+        recover_after_error();
+        return -1;
+    }
     I2C1->ICR = I2C_ICR_STOPCF | I2C_ICR_NACKCF;
     I2C1->CR2 = 0;
     return 0;
@@ -110,12 +150,11 @@ static int wait_stop_clear(void)
 int i2c_write(uint8_t addr7, const uint8_t *data, size_t len)
 {
     if (len > 255) return -1;
-    start_xfer(addr7, len, 0, 1);
+    if (start_xfer(addr7, len, 0, 1, 0) != 0) return -1;
 
     for (size_t i = 0; i < len; i++) {
         if (wait_flag(&I2C1->ISR, I2C_ISR_TXIS) != 0) {
-            I2C1->ICR = I2C_ICR_NACKCF | I2C_ICR_STOPCF;
-            I2C1->CR2 = 0;
+            recover_after_error();
             return -1;
         }
         I2C1->TXDR = data[i];
@@ -127,12 +166,11 @@ int i2c_write(uint8_t addr7, const uint8_t *data, size_t len)
 int i2c_read(uint8_t addr7, uint8_t *data, size_t len)
 {
     if (len > 255 || len == 0) return -1;
-    start_xfer(addr7, len, 1, 1);
+    if (start_xfer(addr7, len, 1, 1, 0) != 0) return -1;
 
     for (size_t i = 0; i < len; i++) {
         if (wait_flag(&I2C1->ISR, I2C_ISR_RXNE) != 0) {
-            I2C1->ICR = I2C_ICR_NACKCF | I2C_ICR_STOPCF;
-            I2C1->CR2 = 0;
+            recover_after_error();
             return -1;
         }
         data[i] = (uint8_t)I2C1->RXDR;
@@ -148,12 +186,11 @@ int i2c_write_read(uint8_t addr7,
     if (wr_len > 255 || rd_len > 255 || rd_len == 0) return -1;
 
     /* Phase 1: write, no AUTOEND so we can issue a repeated START. */
-    start_xfer(addr7, wr_len, 0, 0);
+    if (start_xfer(addr7, wr_len, 0, 0, 0) != 0) return -1;
 
     for (size_t i = 0; i < wr_len; i++) {
         if (wait_flag(&I2C1->ISR, I2C_ISR_TXIS) != 0) {
-            I2C1->ICR = I2C_ICR_NACKCF | I2C_ICR_STOPCF;
-            I2C1->CR2 = 0;
+            recover_after_error();
             return -1;
         }
         I2C1->TXDR = wr[i];
@@ -162,19 +199,17 @@ int i2c_write_read(uint8_t addr7,
     /* Wait for the write phase to complete (TC fires when NBYTES bytes
      * have been transferred and AUTOEND=0). */
     if (wait_flag(&I2C1->ISR, I2C_ISR_TC) != 0) {
-        I2C1->ICR = I2C_ICR_NACKCF | I2C_ICR_STOPCF;
-        I2C1->CR2 = 0;
+        recover_after_error();
         return -1;
     }
 
     /* Phase 2: repeated START + read. AUTOEND on so STOP fires after
      * the last byte is clocked in. */
-    start_xfer(addr7, rd_len, 1, 1);
+    if (start_xfer(addr7, rd_len, 1, 1, 1) != 0) return -1;
 
     for (size_t i = 0; i < rd_len; i++) {
         if (wait_flag(&I2C1->ISR, I2C_ISR_RXNE) != 0) {
-            I2C1->ICR = I2C_ICR_NACKCF | I2C_ICR_STOPCF;
-            I2C1->CR2 = 0;
+            recover_after_error();
             return -1;
         }
         rd[i] = (uint8_t)I2C1->RXDR;

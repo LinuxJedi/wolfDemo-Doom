@@ -11,7 +11,9 @@ extern uint32_t millis(void);
 int I_GetTime(void)
 {
     /* Convert ms to game tics: ticks = ms * TICRATE / 1000. */
-    return (int)((millis() * TICRATE) / 1000u);
+    uint32_t ms = millis();
+    return (int)((ms / 1000u) * TICRATE
+                 + ((ms % 1000u) * TICRATE) / 1000u);
 }
 
 int I_GetTimeMS(void)

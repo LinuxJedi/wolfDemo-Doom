@@ -148,6 +148,12 @@ CPU := -mcpu=cortex-m33 -mthumb -mfloat-abi=hard -mfpu=fpv5-sp-d16
 
 DEFINES := -DSTM32U585xx -DHSE_VALUE=8000000U
 
+# Doom's level renderer should cover the full visible framebuffer each
+# frame. Leave the old defensive 96 KB clear available for hardware
+# artifact checks: `make CLEAR_LEVEL_FRAMEBUFFER=1`.
+CLEAR_LEVEL_FRAMEBUFFER ?= 0
+DEFINES += -DCLEAR_LEVEL_FRAMEBUFFER=$(CLEAR_LEVEL_FRAMEBUFFER)
+
 # ---- Doom engine compile-time configuration --------------------------
 # Mirrors the doom_tiny + small_doom_common + tiny_settings target_compile_
 # definitions blocks in doom/src/CMakeLists.txt. Applied to all C sources;
@@ -271,8 +277,7 @@ LDFLAGS := $(CPU) -T$(LDSCRIPT) \
            -Wl,--gc-sections \
            -Wl,-Map=$(BUILD_DIR)/$(PROJECT).map \
            --specs=nano.specs --specs=nosys.specs \
-           -flto \
-           -u _printf_float
+           -flto
 
 LIBS := -lc -lm -lnosys
 

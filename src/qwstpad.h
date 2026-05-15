@@ -16,9 +16,10 @@
  *    QWSTPAD_BTN_A (0xE)  QWSTPAD_BTN_B (0xC)
  *    QWSTPAD_BTN_X (0xF)  QWSTPAD_BTN_Y (0xD)
  *
- * Returns 0 if the I2C transaction fails (so a missing pad reads as
- * "no buttons pressed"). The caller decides whether to surface that
- * differently.
+ * qwstpad_read_buttons_checked() returns 0 on success and writes the
+ * bitmap to `out`; it returns -1 on I2C failure. The legacy
+ * qwstpad_read_buttons() wrapper keeps the old "bus error means no
+ * buttons pressed" behaviour.
  */
 
 #define QWSTPAD_BTN_U      0x1u
@@ -44,6 +45,7 @@
                             | (1u << QWSTPAD_BTN_MINUS))
 
 int      qwstpad_init(void);          /* 0 on success, -1 if no ACK */
+int      qwstpad_read_buttons_checked(uint16_t *out);
 uint16_t qwstpad_read_buttons(void);  /* 1 = pressed, 0 on bus error */
 
 #endif /* QWSTPAD_H */

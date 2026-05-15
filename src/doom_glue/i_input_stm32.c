@@ -1,9 +1,8 @@
 /*
  * STM32 input glue for the Doom port.
  *
- * No keyboard / joystick yet - the engine sees no input events, so
- * after ~3 s on the title screen it kicks into DEMO1 (attract mode),
- * which is what we want for the first cut.
+ * Local input for the Doom port: wolfDemo buttons plus optional I2C
+ * joystick controllers on the Qwiic / STEMMA-QT bus.
  *
  * The wolfDemo board has two general-purpose push-buttons wired to
  * PB4 (SW2 / BT1) and PB5 (SW4 / BT2), both with external 10K
@@ -49,6 +48,7 @@
 extern boolean menuactive;
 extern int     joybspeed;
 
+extern int I_GetTimeMS(void);
 extern bool show_fps;
 extern void I_EnableMusic(int enable);
 
@@ -117,29 +117,60 @@ static const uint8_t pad_keymap[16] = {
  * Different I2C addresses make detection unambiguous: probe seesaw via
  * its STATUS_HW_ID register first; if that responds with a recognised
  * silicon ID, use the seesaw driver. Otherwise try the QwSTPad init.
- * If neither answers, leave the kind unset so the next tick re-probes
- * (preserves the existing hot-plug retry behaviour).
+ * If neither answers, leave the kind unset and retry later. A missing
+ * device or wedged bus can cost milliseconds per failed I2C transaction,
+ * so probing on every tic would destroy frame rate.
  */
 enum pad_kind { PAD_NONE = 0, PAD_QWSTPAD, PAD_SEESAW };
 static uint8_t pad_kind;
+static uint8_t pad_fail_count;
+static uint16_t pad_cached_state;
+static int pad_next_probe_ms;
+static int pad_last_poll_ms = -1000;
+
+#define PAD_REPROBE_MS          1000
+#define PAD_POLL_MIN_MS         8
+#define PAD_MAX_READ_FAILURES   2
+
+static int32_t elapsed_ms(int now, int then)
+{
+    return (int32_t)((uint32_t)now - (uint32_t)then);
+}
 
 static void pad_init(void)
 {
     if (pad_kind != PAD_NONE) return;
 
+    int now = I_GetTimeMS();
+    if (elapsed_ms(now, pad_next_probe_ms) < 0) return;
+
     if (seesaw_joy_probe() == 0) {
-        if (seesaw_joy_init() == 0) { pad_kind = PAD_SEESAW; return; }
+        if (seesaw_joy_init() == 0) {
+            pad_kind = PAD_SEESAW;
+            pad_fail_count = 0;
+            pad_last_poll_ms = now - PAD_POLL_MIN_MS;
+            return;
+        }
+        pad_next_probe_ms = now + PAD_REPROBE_MS;
+        return;
     }
-    if (qwstpad_init() == 0) { pad_kind = PAD_QWSTPAD; return; }
-    /* Neither detected - retry on the next tick. */
+    if (qwstpad_init() == 0) {
+        pad_kind = PAD_QWSTPAD;
+        pad_fail_count = 0;
+        pad_last_poll_ms = now - PAD_POLL_MIN_MS;
+        return;
+    }
+    pad_next_probe_ms = now + PAD_REPROBE_MS;
 }
 
-static uint16_t pad_read(void)
+static int pad_read(uint16_t *state)
 {
     switch (pad_kind) {
-        case PAD_QWSTPAD: return qwstpad_read_buttons();
-        case PAD_SEESAW:  return seesaw_joy_read_buttons();
-        default:          return 0;
+        case PAD_QWSTPAD: return qwstpad_read_buttons_checked(state);
+        case PAD_SEESAW:  return seesaw_joy_read_buttons_checked(state);
+        default:
+            *state = 0;
+            return 0;
     }
 }
 
@@ -147,7 +178,27 @@ static void pad_tick(void)
 {
     pad_init();
 
-    uint16_t cur = pad_read();
+    int now = I_GetTimeMS();
+    uint16_t cur = pad_cached_state;
+
+    if (pad_kind == PAD_NONE) {
+        cur = 0;
+    } else if (elapsed_ms(now, pad_last_poll_ms) >= PAD_POLL_MIN_MS) {
+        if (pad_read(&cur) == 0) {
+            pad_cached_state = cur;
+            pad_fail_count = 0;
+        } else {
+            cur = 0;
+            pad_cached_state = 0;
+            if (pad_fail_count < 255) pad_fail_count++;
+            if (pad_fail_count >= PAD_MAX_READ_FAILURES) {
+                pad_kind = PAD_NONE;
+                pad_next_probe_ms = now + PAD_REPROBE_MS;
+                pad_fail_count = 0;
+            }
+        }
+        pad_last_poll_ms = now;
+    }
 
     /* B1 is the pad's "primary action" button (QWSTPAD_BTN_A) and we want
      * it to fire in-game (KEY_RCTRL) but confirm in the menu (KEY_ENTER).

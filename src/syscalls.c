@@ -2,6 +2,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/times.h>
+#include <stdint.h>
 #include <unistd.h>
 #include "uart.h"
 
@@ -11,6 +12,7 @@
  */
 
 extern char _end;
+extern char _heap_limit;
 static char *heap_end = &_end;
 
 int _write(int fd, const char *buf, int len)
@@ -35,7 +37,36 @@ int _kill(int pid, int sig) { (void)pid; (void)sig; errno = EINVAL; return -1; }
 
 void *_sbrk(ptrdiff_t incr)
 {
-    char *prev = heap_end;
-    heap_end += incr;
-    return prev;
+    uintptr_t prev = (uintptr_t)heap_end;
+    uintptr_t start = (uintptr_t)&_end;
+    uintptr_t limit = (uintptr_t)&_heap_limit;
+    uintptr_t next;
+
+    if (prev < start || prev > limit) {
+        errno = ENOMEM;
+        return (void *)-1;
+    }
+
+    if (incr >= 0) {
+        uintptr_t add = (uintptr_t)incr;
+        if (add > limit - prev) {
+            errno = ENOMEM;
+            return (void *)-1;
+        }
+        next = prev + add;
+    } else {
+        uintptr_t sub = (uintptr_t)(-(incr + 1)) + 1u;
+        if (sub > prev - start) {
+            errno = ENOMEM;
+            return (void *)-1;
+        }
+        next = prev - sub;
+    }
+
+    if (next < start || next > limit) {
+        errno = ENOMEM;
+        return (void *)-1;
+    }
+    heap_end = (char *)next;
+    return (void *)prev;
 }

@@ -10,12 +10,11 @@
  * i_sound_stm32.c. Each SFX mixer chunk-refill calls
  * music_render_chunk() which produces N OPL samples and services any
  * MIDI callback events whose deadline lies within the chunk's time
- * window. The OPL emulator runs at our 11025 Hz output rate
- * (OPL3_Reset configures rateratio internally to handle the 49716 Hz
- * native -> 11025 Hz output decimation via linear interpolation).
+ * window. The OPL emulator runs at a reduced native rate and this file
+ * decimates into the 11025 Hz DAC stream.
  *
- * Threading: music_render_chunk runs in TIM6 ISR context (same as
- * the SFX mixer's mix_chunk). All other entry points (I_InitMusic,
+ * Threading: music_render_chunk runs from PendSV through the SFX
+ * mixer's mix_chunk. All other entry points (I_InitMusic,
  * I_RegisterSong, I_PlaySong, ...) run in main context. The shared
  * state is the callback queue and opl3_chip; we don't take locks
  * because the ISR is single-priority and main-context paths happen
@@ -218,7 +217,7 @@ void OPL_Delay(uint64_t us)
  * Generate `n` mono OPL samples into `out` (16-bit signed, native
  * range), advancing the music timeline and dispatching any MIDI
  * callbacks whose deadlines fall inside the chunk window. Safe to
- * call from TIM6 ISR context.
+ * call from the low-priority audio refill path.
  *
  * If music is uninitialised or a song isn't loaded, fills `out` with
  * silence and returns - the SFX mixer can blend zeros in cheaply.

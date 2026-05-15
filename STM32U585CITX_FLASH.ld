@@ -16,9 +16,10 @@ _estack = ORIGIN(RAM) + LENGTH(RAM);
 
 _Min_Heap_Size  = 0x200;
 /* 32 KB stack: PendSV runs music synth + SFX mixer on top of whatever
- * main was using, with mix_chunk holding 6 KB of locals (mix_buf +
- * music_buf at HALF_SAMPLES=1024) plus the OPL3 call chain. */
+ * main was using, with mix_chunk holding 3 KB of locals (mix_buf +
+ * music_buf at HALF_SAMPLES=512) plus the OPL call chain. */
 _Min_Stack_Size = 0x8000;
+_heap_limit = _estack - _Min_Stack_Size;
 
 MEMORY
 {

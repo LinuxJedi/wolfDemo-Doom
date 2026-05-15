@@ -3,9 +3,8 @@
 id Software's 1993 Doom running on the wolfDemo board
 (STM32U585CIT6, 2 MB flash, 768 KB SRAM, Cortex-M33 @ 160 MHz)
 through a MIKROE-6078 IPS Display 2 click in mikroBus 1, with SFX
-out of DAC1/PA4 and a 4-LED VU meter on PB12..PB15. Player input
-is intentionally stubbed - the engine plays its own attract-mode
-demos.
+and OPL music out of DAC1/PA4, a 4-LED VU meter on PB12..PB15,
+and optional QwSTPad / seesaw joystick input over I2C.
 
 The port is based on `kilograham/rp2040-doom`, which already runs
 full shareware Doom in 264 KB SRAM and 2 MB flash on a Pi Pico.
@@ -14,10 +13,9 @@ SRAM, faster M33 with FPU/DSP/cache, same 2 MB flash).
 
 ## What it does
 
-The current `build/wolfDemo-doom.elf` (~2.00 MB / 724 KB BSS):
+The current firmware:
 - runs the full Doom engine (`D_DoomMain`) in 256 KB of zone SRAM,
-  with a 96 KB RGB565 mirror buffer and 128 KB of wipe snapshots
-  (~27 KB of the 768 KB SRAM still free after the perf caches)
+  with two 96 KB RGB565 ping-pong buffers and in-place wipe melt
 - renders **TITLEPIC**, **CREDIT**, **HELP** etc. pixel-accurate from
   the WHD-compressed splash lumps with the active PLAYPAL palette
 - ticks the demo loop: TITLEPIC -> DEMO1 -> CREDIT -> DEMO2 -> ...
@@ -33,41 +31,33 @@ The current `build/wolfDemo-doom.elf` (~2.00 MB / 724 KB BSS):
   bodies, projectiles, blood splats) with player-colour translation,
   and the **player weapon** overlay
 - has an optional **FPS counter** at top-right (off by default;
-  toggle via SW2 / SW4 buttons), drawn with a 3x-scaled bitmap
+  toggle via SW2), drawn with a 3x-scaled bitmap
   font over a black inset for legibility on the click panel
-- emits **Doom SFX** through DAC1 / PA4 at 11025 Hz. The TIM6
+- emits **Doom SFX and OPL music** through DAC1 / PA4 at 11025 Hz. The TIM6
   update event raises an IRQ; the IRQ handler writes one sample
-  to `DAC1->DHR8R1` per tick, and at chunk boundaries kicks the
-  software mixer (up to 8 channels, same ADPCM-decode + IIR
-  low-pass path as `i_picosound.c`). The four LEDs (PB12..PB15)
+  to `DAC1->DHR12R1` per tick, and at chunk boundaries pends
+  the low-priority software mixer (up to 8 SFX channels plus OPL).
+  The four LEDs (PB12..PB15)
   act as a cumulative VU meter on the post-mix peak per chunk.
 - pushes frames through `I_FinishUpdate` -> ISR-driven background DMA
   on GPDMA1 channel 0 -> ST7789 SPI in continuous mode at 40 MHz.
-  Render and blit run in parallel: per-frame budget collapses from
-  `render + blit` to `max(render, blit) + 1.4 ms convert`. Hits the
+  Render and blit run in parallel with no 8 bpp -> RGB565 conversion
+  pass: per-frame budget collapses from `render + blit` to
+  `max(render, blit)`. Hits the
   engine's 35 Hz target in typical scenes; large open areas with
   many sprites/visplanes drop to ~12-15 FPS (see Perf below)
 
-What's still stubbed / known issues (see "Open work items" for
-details):
-- **music** stays stubbed. The `I_*Music` calls in
-  `i_sound_stm32.c` are no-op stubs.
-- **input** (intentionally stubbed; demo plays itself). The two
-  user buttons (SW2/PB4, SW4/PB5) are wired only to toggle the
-  FPS counter, not to player input.
+Known issues (see "Open work items" for details):
 - **floor sky** (F_SKY1 *floors* still draw as flat silhouette;
   only ceilings dispatch through PDCOL_SKY).
-- **masked mid-textures** (door bars, fences, transparent walls)
-  do not render. Sprite-vs-wall occlusion via drawseg silhouettes
-  is unaffected.
 
 ### Perf
 
 Hits the engine's 35 Hz target in typical scenes. Heavy open areas
 with many visplanes / sprites still drop to ~12-15 FPS. Render and
 SPI blit run in parallel via GPDMA1 channel 0 in continuous mode
-plus a 96 KB RGB565 mirror buffer; per-frame budget is
-`max(render, blit ~19 ms) + 1.4 ms convert`.
+plus a second 96 KB RGB565 buffer; per-frame budget is
+`max(render, blit ~19 ms)`.
 
 Optimizations already in:
 
@@ -186,12 +176,13 @@ wolfDemo-doom/
       pico/sem.h            semaphore_t placeholder for DOOM_TINY paths
       SDL_endian.h          minimal SDL_SwapLE16/32 macros
       tiny.whd.h            aliases tiny_whd to _binary_wad_doom1_whx_start
-      i_video_stm32.c       framebuffer (320x200 8bpp), I_SetPalette,
-                            I_SetPaletteNum, I_FinishUpdate (palette ->
-                            RGB565, 320 -> 240 column drop, SPI blit)
-      i_input_stm32.c       all inputs report no events (attract mode)
+      i_video_stm32.c       RGB565 ping-pong framebuffer, I_SetPalette,
+                            I_SetPaletteNum, I_FinishUpdate (320 -> 240
+                            column drop, SPI blit)
+      i_input_stm32.c       SW2/SW4 buttons plus QwSTPad / seesaw joystick
       i_sound_stm32.c       SFX mixer + DAC1/PA4 output via TIM6
-                            update IRQ at 11025 Hz; music stubbed
+                            update IRQ at 11025 Hz
+      i_music_stm32.c       OPL2 music driver feeding the SFX mixer
       i_timer_stm32.c       SysTick @ 1 kHz -> TICRATE
       i_system_stm32.c      I_Error / I_Quit / panic / I_ZoneBase
                             (256 KB static zone), I_Realloc, etc.
@@ -213,19 +204,12 @@ wolfDemo-doom/
 
 ## Open work items
 
-- **Music (MUS / OPL)**. Out of scope so far. Would need OPL
-  emulation in a TIM-driven mixer, plus MUS-to-MIDI plumbing.
-  Likely cuts deeply into the FPS budget.
-- **Masked mid-textures** (door bars, fences, transparent walls).
-  `R_RenderMaskedSegRange` is stubbed in `doom/src/doom/r_segs.c`
-  because its upstream body relies on direct
-  `curline->frontsector` / `curline->sidedef->midtexture` access
-  and the legacy `texturetranslation` / `R_GetColumn(int)` /
-  `R_DrawMaskedColumn(column_t*)` signatures, all incompatible
-  with the `SHRINK_MOBJ` / `USE_RAW_MAPSEG` / WHD framedrawable
-  surface. The original body is preserved inside `#if 0` for a
-  future port. Sprite-vs-wall occlusion is unaffected (drawseg
-  silhouettes from `R_StoreWallRange` still drive that path).
+- **Floor sky**. `F_SKY1` ceilings dispatch through the sky texture
+  cache, but `F_SKY1` floors still draw as a flat silhouette.
+- **Framebuffer clear validation**. The default build skips the old
+  defensive 96 KB level-frame clear (`CLEAR_LEVEL_FRAMEBUFFER=0`) to
+  save a few milliseconds per frame. If hardware testing shows stale
+  pixels, rebuild with `make CLEAR_LEVEL_FRAMEBUFFER=1`.
 - **More FPS in heavy scenes**. Typical scenes hit the 35 Hz cap;
   open areas with many sprites / visplanes still drop to ~12-15
   FPS. The remaining lever the Perf section calls out is

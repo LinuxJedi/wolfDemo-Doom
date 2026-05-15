@@ -193,7 +193,7 @@ static int ss_read_axis(uint8_t channel, uint16_t *out)
     return 0;
 }
 
-uint16_t seesaw_joy_read_buttons(void)
+int seesaw_joy_read_buttons_checked(uint16_t *out)
 {
     uint16_t bitmap = 0;
 
@@ -201,7 +201,7 @@ uint16_t seesaw_joy_read_buttons(void)
      * lines idle high (pull-up) and read low when pressed. */
     uint8_t gpio[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
     if (ss_read(SEESAW_GPIO_BASE, SEESAW_GPIO_BULK, gpio, 4, 250) != 0) {
-        return 0;
+        return -1;
     }
     uint32_t gpio_state = ((uint32_t)gpio[0] << 24) |
                          ((uint32_t)gpio[1] << 16) |
@@ -223,8 +223,8 @@ uint16_t seesaw_joy_read_buttons(void)
      * subtraction underflow-safe regardless of where the centre lands. */
     uint16_t x = ss_x_center;
     uint16_t y = ss_y_center;
-    if (ss_read_axis(SS_ADC_X1, &x) != 0) return 0;
-    if (ss_read_axis(SS_ADC_Y1, &y) != 0) return 0;
+    if (ss_read_axis(SS_ADC_X1, &x) != 0) return -1;
+    if (ss_read_axis(SS_ADC_Y1, &y) != 0) return -1;
 
     if (y > (uint16_t)(ss_y_center + ss_y_dz_high))
         bitmap |= (1u << QWSTPAD_BTN_U);
@@ -248,5 +248,13 @@ uint16_t seesaw_joy_read_buttons(void)
     }
 #endif
 
-    return bitmap;
+    *out = bitmap;
+    return 0;
+}
+
+uint16_t seesaw_joy_read_buttons(void)
+{
+    uint16_t buttons = 0;
+    (void)seesaw_joy_read_buttons_checked(&buttons);
+    return buttons;
 }

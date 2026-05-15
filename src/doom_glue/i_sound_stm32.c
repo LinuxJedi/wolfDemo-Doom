@@ -1,8 +1,8 @@
 /*
  * STM32 sound glue for the Doom port.
  *
- * Provides Phase 8 SFX playback. Music remains stubbed - MUS / OPL
- * emulation is out of scope for this port.
+ * Provides Doom SFX playback and feeds OPL music from i_music_stm32.c
+ * through the same DAC output path.
  *
  * --- Output stage ----------------------------------------------------
  * DAC1 channel 1 on PA4 (analog mode, output buffer enabled, normal
@@ -373,7 +373,7 @@ static void audio_hw_init(void)
 
     /* DAC channel 1: normal mode (MCR.MODE1 = 000 = output buffer
      * enabled, connected to external pin), no trigger, no DMA. We
-     * write DHR8R1 directly from the TIM6 IRQ at 11025 Hz.
+     * write DHR12R1 directly from the TIM6 IRQ at 11025 Hz.
      *
      * MCR.HFSEL must match the DAC AHB clock band: 00 is rated only
      * up to 80 MHz, 01 covers 80..160 MHz, 10 covers up to 200 MHz.
@@ -381,7 +381,7 @@ static void audio_hw_init(void)
     DAC1->MCR = (1u << DAC_MCR_HFSEL_Pos);
     DAC1->CR  = 0;                          /* disable while configuring */
     DAC1->CR  = 0;                          /* TEN1=0: no trigger; the
-                                               next DHR8R1 write takes
+                                               next DHR12R1 write takes
                                                effect immediately */
     /* Pre-load mid-rail so the speaker is biased before the IRQ runs. */
     DAC1->DHR12R1 = DAC_BIAS_12BIT;

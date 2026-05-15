@@ -42,6 +42,7 @@
 
 int      seesaw_joy_probe(void);         /* 0 if HW_ID looks like a seesaw chip, -1 otherwise */
 int      seesaw_joy_init(void);          /* 0 on success, -1 on bus error */
+int      seesaw_joy_read_buttons_checked(uint16_t *out);
 uint16_t seesaw_joy_read_buttons(void);  /* QwSTPad-layout bitmap; 0 on bus error */
 
 #endif /* SEESAW_JOY_H */

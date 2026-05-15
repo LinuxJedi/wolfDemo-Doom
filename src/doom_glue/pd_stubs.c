@@ -13,9 +13,8 @@
  *     (TITLEPIC / CREDIT / HELP2) for GS_DEMOSCREEN, run ST_Drawer for
  *     GS_LEVEL to populate the patchlist with status-bar widgets, drain
  *     the patchlist into I_VideoBuffer, blit via I_FinishUpdate.
- *   - Wipe state machine: stubbed to never enter a wipe. The engine's
- *     do/while (wipestate) loop in D_RunFrame would otherwise spin
- *     forever waiting for wipe_min to advance.
+ *   - Wipe state machine: in-place classic melt using the two RGB565
+ *     ping-pong buffers as "from" and "to" snapshots.
  *   - pd_add_column: textured wall sampling for PDCOL_TOP / MID /
  *     BOTTOM / SKY via a single-slot Huffman patch-decoder cache and
  *     per-column decode + iscale/texturemid/colormap sample. Multi-
@@ -23,7 +22,7 @@
  *     which walks the WHD_COL_SEG_* segment stream to stitch each
  *     contributing patch into one 128-byte sample buffer.
  *   - pd_add_plane_column: textured floor/ceiling spans with flat
- *     decoder + 4-slot LRU cache and per-pixel R_MapPlane projection.
+ *     decoder + LRU cache and span-major projection.
  *   - pd_add_masked_columns: sprite columns (and masked mid-textures)
  *     decoded through the same patch decoder cache as walls, with
  *     dc_translation_index applied for player-colour remap.
@@ -76,6 +75,10 @@ extern void button_tick(void);
 #define DOOM_W      320          /* logical render width (engine geometry) */
 #define DOOM_H      200
 #define DISP_W      240          /* physical scan-out width (RGB565 buffer) */
+
+#ifndef CLEAR_LEVEL_FRAMEBUFFER
+#define CLEAR_LEVEL_FRAMEBUFFER 1
+#endif
 
 /* Compact x from 320-space to 240-space by dropping every 4th column.
  * Equivalent to (x * 3) / 4 but avoids the multiply. The (x & 3) == 3
@@ -1012,7 +1015,7 @@ static void drain_sprite_queues(void)
  * WHD flats are 64x64 = 4096-pixel tiles, Huffman-encoded. Decoding
  * one is much cheaper than a multi-patch texture but still ~10K cycles.
  * E1M1's view typically shows 2-3 distinct flats at a time (CEIL5_1
- * + FLOOR4_8 + FLOOR0_1 ish), so a 4-slot LRU keeps the steady state
+ * + FLOOR4_8 + FLOOR0_1 ish), so the 7-slot LRU keeps the steady state
  * decode-free. */
 /* Flat decoder LRU cache. Each slot is one 64x64 = 4096-byte tile.
  * The RGB565 framebuffer refactor freed 64 KB (doom_fb removed) but
@@ -1635,7 +1638,9 @@ void pd_begin_frame(void)
      * OPL synth for 5-30 ms). Moving the memset doesn't help since
      * PendSV is independent of frame phase. The real fix would be a
      * GPDMA m2m clear running in background, but that's deferred. */
-    if (gamestate == GS_LEVEL && wipestate == WIPESTATE_NONE) {
+    if (CLEAR_LEVEL_FRAMEBUFFER
+        && gamestate == GS_LEVEL
+        && wipestate == WIPESTATE_NONE) {
         /* RGB565 0x0000 == black, so a byte-zero clear covers the
          * whole 240*200 uint16_t buffer. */
 #if PERF_INSTRUMENT

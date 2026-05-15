@@ -55,18 +55,25 @@ int qwstpad_init(void)
     return 0;
 }
 
-uint16_t qwstpad_read_buttons(void)
+int qwstpad_read_buttons_checked(uint16_t *out)
 {
     uint8_t reg = TCA9555_REG_INPUT0;
     uint8_t in[2] = { 0xFF, 0xFF };  /* idle-high default = no buttons */
 
     if (i2c_write_read(QWSTPAD_I2C_ADDR, &reg, 1, in, 2) != 0) {
-        /* Bus error / pad unplugged - report all-released. */
-        return 0;
+        return -1;
     }
 
     /* Buttons read low when pressed, so invert and mask off the LED
      * and reserved bits. */
     uint16_t raw = (uint16_t)in[0] | ((uint16_t)in[1] << 8);
-    return ((uint16_t)~raw) & (uint16_t)QWSTPAD_BUTTON_MASK;
+    *out = ((uint16_t)~raw) & (uint16_t)QWSTPAD_BUTTON_MASK;
+    return 0;
+}
+
+uint16_t qwstpad_read_buttons(void)
+{
+    uint16_t buttons = 0;
+    (void)qwstpad_read_buttons_checked(&buttons);
+    return buttons;
 }
