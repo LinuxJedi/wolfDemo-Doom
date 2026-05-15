@@ -119,13 +119,11 @@ Toolchain: `arm-none-eabi-gcc` 15.2 confirmed working,
 `stm32flash` and `openocd`. On macOS via Homebrew:
 `brew install --cask gcc-arm-embedded && brew install stm32flash openocd`.
 
-Clone with submodules so the patched rp2040-doom checkout lands
-under `doom/`:
+Clone the repository normally; the minimal Doom engine snapshot is
+vendored under `doom/`:
 
 ```
-git clone --recurse-submodules https://github.com/LinuxJedi/wolfDemo-Doom
-# or, after a bare clone:
-git submodule update --init --recursive
+git clone https://github.com/LinuxJedi/wolfDemo-Doom
 ```
 
 Build / flash:
@@ -195,10 +193,9 @@ wolfDemo-doom/
                             th_bit_overrun, etc.)
   wad/
     doom1.whx               1.8 MB WHD-compressed shareware DOOM1.WAD
-  doom/                     git submodule of kilograham/rp2040-doom
-                            (with a small wolfDemo-specific patch
-                            branch; see License section for what's
-                            modified)
+  doom/                     minimal vendored Doom engine snapshot from
+                            LinuxJedi/rp2040-doom wolfdemo; see
+                            doom/README.wolfdemo.md for provenance
   build/                    output (ELF, bin, hex, .map)
 ```
 
@@ -222,9 +219,9 @@ wolfDemo-doom/
 This project is GPL-2.0-or-later. See [LICENSE](LICENSE) for the
 full text.
 
-The `doom/` submodule and `wad/doom1.whx` are GPL-2.0+
+The vendored `doom/` engine snapshot and `wad/doom1.whx` are GPL-2.0+
 (id Software / Chocolate Doom / Graham Sanderson) and dictate the
-licensing of the whole derivative work. Vendored CMSIS headers
-under `cmsis/` are Apache 2.0 (ST / Arm), which is GPL-compatible.
-The wolfDemo-specific glue (`Makefile`, `STM32U585CITX_FLASH.ld`,
+licensing of the whole derivative work. Vendored CMSIS headers under
+`cmsis/` are Apache 2.0 (ST / Arm), which is GPL-compatible. The
+wolfDemo-specific glue (`Makefile`, `STM32U585CITX_FLASH.ld`,
 `startup/`, `src/`) is GPL-2.0-or-later.
